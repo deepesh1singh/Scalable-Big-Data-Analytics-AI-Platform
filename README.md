@@ -153,12 +153,3 @@ can die.
 pip install pyspark==3.5.1 pandas pyarrow
 python pyspark-tutorial/01_rdd.py
 ```
-
-Local mode gives you the full Spark UI at `http://localhost:4040` while a job
-is alive — which serverless Databricks does not. For learning internals, local
-is genuinely the better environment.
-
-## Licence
-
-MIT. Datasets retain their own licences: MovieLens (GroupLens, research/
-educational use), Yelp reviews via Hugging Face, NYC TLC (public domain).
