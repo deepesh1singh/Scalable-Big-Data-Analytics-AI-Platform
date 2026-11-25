@@ -1,0 +1,654 @@
+<meta charset="utf-8">
+<title>ClickHouse — Step by Step</title>
+<style>
+  @page { size: A4; margin: 15mm 14mm; }
+  body { font-family: -apple-system, "Helvetica Neue", Arial, sans-serif;
+         font-size: 10.4pt; line-height: 1.5; color: #16181d; margin: 0; }
+  h1 { font-size: 23pt; margin: 0 0 4pt; letter-spacing: -0.5pt; }
+  h2 { font-size: 15pt; margin: 0 0 8pt; padding: 5pt 0 5pt 0;
+       border-bottom: 2.5px solid #F5C000; page-break-after: avoid; }
+  h3 { font-size: 11.5pt; margin: 12pt 0 4pt; color: #0b3d6b; page-break-after: avoid; }
+  p { margin: 5pt 0; }
+  ul, ol { margin: 5pt 0; padding-left: 17pt; }
+  li { margin: 3pt 0; }
+  code { font-family: "SF Mono", Menlo, monospace; font-size: 8.9pt;
+         background: #eef1f5; padding: 0.5pt 3pt; border-radius: 2px; }
+  pre { font-family: "SF Mono", Menlo, monospace; font-size: 8.4pt; line-height: 1.45;
+        background: #f6f8fa; border: 1px solid #d8dee4; border-left: 3px solid #F5C000;
+        border-radius: 3px; padding: 7pt 9pt; white-space: pre-wrap;
+        page-break-inside: avoid; margin: 6pt 0; }
+  table { border-collapse: collapse; width: 100%; font-size: 9pt; margin: 6pt 0;
+          page-break-inside: avoid; }
+  th, td { border: 1px solid #c9d1d9; padding: 4pt 6pt; text-align: left; vertical-align: top; }
+  th { background: #eaeef2; font-weight: 600; }
+  .lesson { page-break-before: always; }
+  .warn { background: #fdeeee; border-left: 3px solid #c62828; border: 1px solid #e0b4b4;
+          padding: 7pt 9pt; margin: 7pt 0; font-size: 9.5pt; page-break-inside: avoid; }
+  .why { background: #eef7ee; border-left: 3px solid #2e7d32; border: 1px solid #b9d9b9;
+         padding: 7pt 9pt; margin: 7pt 0; font-size: 9.5pt; page-break-inside: avoid; }
+  .out { background: #1e2128; color: #d7dae0; border-left: 3px solid #6ba644;
+         padding: 6pt 9pt; margin: 5pt 0; font-family: "SF Mono", Menlo, monospace;
+         font-size: 8.3pt; white-space: pre-wrap; border-radius: 3px;
+         page-break-inside: avoid; }
+  .cover { border: 3px solid #16181d; padding: 18pt; margin-bottom: 12pt; }
+  .small { font-size: 8.9pt; color: #444; }
+  .step { display: inline-block; background: #16181d; color: #F5C000; font-weight: 700;
+          padding: 1pt 8pt; border-radius: 3px; font-size: 10pt; margin-right: 6pt; }
+  .toc { font-size: 9.6pt; }
+  .toc td:first-child { width: 42pt; font-weight: 700; }
+</style>
+
+<div class="cover">
+<h1>ClickHouse — Step by Step</h1>
+<p class="small" style="margin-top:2pt">A practical path from install to production patterns. Every number in
+this guide was measured on a laptop against 43 million real rows.</p>
+<table>
+<tr><th style="width:24%">How to use</th><td>Run every command. Don't read it like prose — the point is watching
+the timings change when you change the table.</td></tr>
+<tr><th>Dataset</th><td>OpenCelliD cell towers, 43,276,150 rows. One free download, no login.</td></tr>
+<tr><th>Time</th><td>~4 hours total. Lessons 1&ndash;5 in one sitting, 6&ndash;12 in another.</td></tr>
+<tr><th>Prereq</th><td>You know SQL. That's it.</td></tr>
+</table>
+</div>
+
+<h3>Contents</h3>
+<table class="toc">
+<tr><td>1</td><td><b>Install and connect</b> — get a server running in 2 minutes</td></tr>
+<tr><td>2</td><td><b>Load real data</b> — 43M rows in 33 seconds</td></tr>
+<tr><td>3</td><td><b>ORDER BY is everything</b> — the one concept that matters most</td></tr>
+<tr><td>4</td><td><b>Reading EXPLAIN</b> — proving the index works</td></tr>
+<tr><td>5</td><td><b>Table engines</b> — MergeTree and its family</td></tr>
+<tr><td>6</td><td><b>Inserting properly</b> — batches, parts, and why it matters</td></tr>
+<tr><td>7</td><td><b>Updates and deletes</b> — the ClickHouse way</td></tr>
+<tr><td>8</td><td><b>Materialized views</b> — 22&times; faster, 54 KB instead of 896 MB</td></tr>
+<tr><td>9</td><td><b>Compression</b> — codecs, and when they backfire</td></tr>
+<tr><td>10</td><td><b>Skip indexes and projections</b> — 6&times; and 14&times;</td></tr>
+<tr><td>11</td><td><b>SQL you won't find elsewhere</b> — the useful extras</td></tr>
+<tr><td>12</td><td><b>Scaling and production</b> — when to shard, when not to</td></tr>
+</table>
+
+<div class="why"><b>The one habit.</b> After every change, run <code>EXPLAIN indexes = 1</code> and look at the
+<code>Granules: X/Y</code> line. That ratio tells you whether ClickHouse is skipping data or scanning
+everything. It is the single most useful number in the system.</div>
+
+<!-- ===================== 1 ===================== -->
+<div class="lesson"></div>
+<h2><span class="step">1</span> Install and connect</h2>
+
+<pre>curl https://clickhouse.com/ | sh      # downloads a single binary
+./clickhouse server                    # terminal 1 — leave running
+./clickhouse client                    # terminal 2</pre>
+
+<p>One binary, no dependencies, no config file needed. The server listens on <b>9000</b> (native
+protocol) and <b>8123</b> (HTTP).</p>
+
+<h3>Credentials</h3>
+<p>Default user is <code>default</code> with <b>no password</b>. Nothing is generated for you to find.</p>
+<pre>./clickhouse client                              # just works
+./clickhouse client --user default --password ''  # same thing
+curl 'http://localhost:8123/?query=SELECT%20version()'</pre>
+
+<div class="warn"><b>Where is my data?</b> The server starts with <code>--path=./</code>, meaning the data
+directory is <b>whatever folder you launched it from</b>. Start it somewhere else and you get a fresh empty
+server while the old data sits in the previous folder. This confuses everyone once.</div>
+
+<h3>Set a password (optional for local dev)</h3>
+<pre>ALTER USER default IDENTIFIED WITH sha256_password BY 'yourpassword';</pre>
+<p>Not needed locally — the listener binds to <code>127.0.0.1</code> only, so nothing off your machine can
+reach it. It matters the moment you bind to <code>0.0.0.0</code>.</p>
+
+<h3>Useful client flags</h3>
+<table>
+<tr><td><code>-q "SQL"</code></td><td>run one query and exit</td></tr>
+<tr><td><code>--time</code></td><td>print elapsed seconds — you'll use this constantly</td></tr>
+<tr><td><code>--format PrettyCompact</code></td><td>readable tables</td></tr>
+<tr><td><code>--multiline</code></td><td>let queries span lines in the shell</td></tr>
+</table>
+
+<!-- ===================== 2 ===================== -->
+<div class="lesson"></div>
+<h2><span class="step">2</span> Load real data</h2>
+
+<p>Toy data teaches nothing about performance. Use the OpenCelliD dataset — 43 million real cell towers,
+publicly hosted, no signup.</p>
+
+<h3>Create the table</h3>
+<pre>CREATE TABLE cell_towers
+(
+    radio    Enum8('' = 0, 'CDMA' = 1, 'GSM' = 2, 'LTE' = 3, 'NR' = 4, 'UMTS' = 5),
+    mcc      UInt16,          -- country code
+    net      UInt16,          -- operator
+    area     UInt16,
+    cell     UInt64,
+    unit     Int16,
+    lon      Float64,
+    lat      Float64,
+    range    UInt32,
+    samples  UInt32,
+    changeable UInt8,
+    created  DateTime,
+    updated  DateTime,
+    averageSignal UInt8
+)
+ENGINE = MergeTree
+ORDER BY (radio, mcc, net, created);</pre>
+
+<h3>Load it — no download step needed</h3>
+<pre>INSERT INTO cell_towers
+SELECT * FROM url('https://datasets.clickhouse.com/cell_towers.csv.xz', 'CSVWithNames',
+'radio String, mcc UInt16, net UInt16, area UInt16, cell UInt64, unit Int16,
+ lon Float64, lat Float64, range UInt32, samples UInt32, changeable UInt8,
+ created DateTime, updated DateTime, averageSignal UInt8');</pre>
+
+<div class="out">43,276,150 rows in 33 seconds  (~1.3 million rows/sec)</div>
+
+<p><code>url()</code> streams the download, decompresses the <code>.xz</code>, and parses the CSV in one
+statement. Nothing touches local disk. The same works for <code>s3()</code>, <code>file()</code>, and
+<code>https</code> Parquet.</p>
+
+<h3>First look</h3>
+<pre>SELECT radio, count() AS towers FROM cell_towers GROUP BY radio ORDER BY towers DESC;</pre>
+<div class="out">UMTS   20,686,487    47.8%
+LTE    12,101,148    28.0%
+GSM     9,931,304    22.9%
+CDMA      556,344     1.3%
+NR            867     0.0%     &lt;- snapshot is from Feb 2021, 5G barely deployed
+
+Query time: 0.033 sec</div>
+
+<div class="why"><b>33 milliseconds to aggregate 43 million rows on a laptop.</b> That is the whole pitch.
+No cluster, no tuning, no indexes created. Keep this number in mind for the rest of the guide.</div>
+
+<!-- ===================== 3 ===================== -->
+<div class="lesson"></div>
+<h2><span class="step">3</span> ORDER BY is everything</h2>
+
+<p>If you learn one thing from this guide, learn this. <code>ORDER BY</code> in a MergeTree table is
+<b>not</b> a sorting preference. It is:</p>
+<ol>
+<li>The <b>physical order</b> rows are stored on disk</li>
+<li>The <b>primary index</b> ClickHouse uses to skip data</li>
+</ol>
+
+<h3>How the sparse index works</h3>
+<pre>Rows are stored sorted by ORDER BY, split into GRANULES of 8192 rows.
+ClickHouse stores ONE index entry per granule — not per row.
+
+granule 0  -> first row: (LTE, 202, ...)
+granule 1  -> first row: (LTE, 208, ...)
+granule 2  -> first row: (LTE, 310, ...)   &lt;- binary search lands here
+...
+5284 granules total for 43M rows
+
+WHERE radio='LTE' AND mcc=310
+  -> binary search the index
+  -> read ONLY the matching granules</pre>
+
+<div class="why"><b>Sparse, not dense.</b> A B-tree index in Postgres points at individual rows. ClickHouse
+points at blocks of 8192. That is why the index is tiny enough to sit in memory for a 43M-row table, and why
+ClickHouse is not good at single-row lookups — it always reads at least one full granule.</div>
+
+<h3>Choosing the columns</h3>
+<table>
+<tr><th>Rule</th><th>Why</th></tr>
+<tr><td>Put the column you <b>filter on most</b> first</td><td>Only a leading prefix can be binary-searched</td></tr>
+<tr><td>Low cardinality first, high last</td><td>Better compression, better skipping</td></tr>
+<tr><td>Time column usually last</td><td>Naturally sorted within each group</td></tr>
+<tr><td>3&ndash;4 columns is plenty</td><td>Later columns rarely help</td></tr>
+</table>
+
+<pre>-- Multi-tenant serving: tenant id FIRST, always
+ORDER BY (company_id, event_date, device_id)
+
+-- Not this — company_id filters can't use the index
+ORDER BY (event_date, device_id, company_id)</pre>
+
+<div class="warn"><b>You cannot change ORDER BY later.</b> Only <i>extend</i> it with more columns at the end.
+Changing the existing columns means creating a new table and copying everything. Choose deliberately on day one.</div>
+
+<!-- ===================== 4 ===================== -->
+<div class="lesson"></div>
+<h2><span class="step">4</span> Reading EXPLAIN</h2>
+
+<p>This is how you verify the index is doing work. Run it on every slow query.</p>
+
+<h3>A query that uses the index</h3>
+<pre>EXPLAIN indexes = 1
+SELECT count() FROM cell_towers WHERE radio = 'LTE' AND mcc = 310;</pre>
+<div class="out">Indexes:
+  PrimaryKey
+    Keys: radio, mcc
+    Condition: and((mcc in [310, 310]), (radio in [3, 3]))
+    Parts:    4/4
+    Granules: 330/5284          &lt;-- 93.8% SKIPPED
+    Search Algorithm: binary search</div>
+
+<h3>A query that does not</h3>
+<pre>EXPLAIN indexes = 1
+SELECT count() FROM cell_towers WHERE lat BETWEEN 51.0 AND 51.9;</pre>
+<div class="out">Indexes:
+  PrimaryKey
+    Condition: true             &lt;-- no usable condition
+    Parts:    4/4
+    Granules: 5284/5284         &lt;-- FULL SCAN, 0% skipped</div>
+
+<div class="why"><b>The two lines that matter:</b><br>
+<code>Granules: 330/5284</code> — how much data was skipped. This is your index effectiveness.<br>
+<code>Condition: true</code> — means the index could say nothing. Your filter column is not in
+<code>ORDER BY</code>.</div>
+
+<h3>Other EXPLAIN modes</h3>
+<table>
+<tr><td><code>EXPLAIN indexes=1</code></td><td>granule skipping &mdash; <b>use this one</b></td></tr>
+<tr><td><code>EXPLAIN PIPELINE</code></td><td>the parallel execution stages</td></tr>
+<tr><td><code>EXPLAIN ESTIMATE</code></td><td>rows/parts it expects to read</td></tr>
+<tr><td><code>EXPLAIN SYNTAX</code></td><td>the query after rewriting</td></tr>
+</table>
+
+<h3>Bonus: why count() is instant</h3>
+<pre>SELECT count() FROM cell_towers;   -- 0.001 sec</pre>
+<p>A bare <code>count()</code> is answered from part metadata. No data is read at all.</p>
+
+<!-- ===================== 5 ===================== -->
+<div class="lesson"></div>
+<h2><span class="step">5</span> Table engines</h2>
+
+<p>The engine decides how data is stored and what happens on merge. 95% of tables are one of the first two.</p>
+
+<table>
+<tr><th style="width:32%">Engine</th><th>Behaviour</th><th>Use for</th></tr>
+<tr><td><code>MergeTree</code></td><td>Plain append-only</td><td>Facts, events, logs</td></tr>
+<tr><td><code>ReplacingMergeTree(ver)</code></td><td>Keeps last row per key</td><td><b>Upserts</b>, dimensions, CDC</td></tr>
+<tr><td><code>SummingMergeTree</code></td><td>Sums numeric columns per key</td><td>Rollup targets</td></tr>
+<tr><td><code>AggregatingMergeTree</code></td><td>Merges aggregate states</td><td>uniq / avg / quantile rollups</td></tr>
+<tr><td><code>Replicated*</code></td><td>Any of the above + replication</td><td>Production HA</td></tr>
+</table>
+
+<h3>ReplacingMergeTree — the upsert pattern</h3>
+<pre>CREATE TABLE devices (
+    device_id String,
+    status    String,
+    updated   DateTime
+) ENGINE = ReplacingMergeTree(updated)
+ORDER BY device_id;                    -- ORDER BY == the dedup key
+
+INSERT INTO devices VALUES ('d1', 'active',  now());
+INSERT INTO devices VALUES ('d1', 'retired', now());   -- the "update"</pre>
+
+<div class="warn"><b>Deduplication is eventual, not immediate.</b> It happens during background merges at an
+unpredictable time. Until then you see both rows.
+<pre>SELECT * FROM devices;         -- may show BOTH rows
+SELECT * FROM devices FINAL;   -- correct now, slightly slower</pre>
+<code>FINAL</code> is the single biggest surprise for anyone coming from Postgres or MySQL.</div>
+
+<h3>What is a "part"?</h3>
+<pre>data/default/cell_towers/
+├── all_1_31_2/     &lt;- a PART: an immutable folder of sorted, compressed columns
+├── all_32_37_1/
+└── all_38_38_0/</pre>
+<p>Every INSERT writes new parts. Background threads merge small parts into bigger ones. That merging is
+where <code>ReplacingMergeTree</code> dedups and <code>SummingMergeTree</code> sums.</p>
+
+<!-- ===================== 6 ===================== -->
+<div class="lesson"></div>
+<h2><span class="step">6</span> Inserting properly</h2>
+
+<h3>The rule</h3>
+<div class="why"><b>Insert in big batches. 10,000 to 1,000,000 rows at a time.</b><br>
+Every INSERT statement creates at least one new part. Thousands of tiny inserts create thousands of parts,
+background merges can't keep up, and you hit <code>TOO_MANY_PARTS</code> and the table stops accepting writes.</div>
+
+<pre>-- BAD: 1000 statements = 1000 parts
+INSERT INTO t VALUES (1);
+INSERT INTO t VALUES (2);   ...
+
+-- GOOD: one statement, many rows
+INSERT INTO t VALUES (1),(2),(3), ... (100000);</pre>
+
+<h3>When you can't batch — async inserts</h3>
+<pre>SET async_insert = 1, wait_for_async_insert = 1;</pre>
+<p>ClickHouse buffers incoming rows <b>server-side</b> and flushes one part per ~10 MB or per second. This is
+the standard fix for high-frequency writes from an application or a Kafka consumer.</p>
+
+<h3>Loading from files</h3>
+<pre>-- from the shell
+clickhouse client -q "INSERT INTO t FORMAT Parquet"      &lt; data.parquet
+clickhouse client -q "INSERT INTO t FORMAT CSVWithNames" &lt; data.csv
+
+-- from SQL
+INSERT INTO t SELECT * FROM file('/path/data.parquet', Parquet);
+INSERT INTO t SELECT * FROM url('https://host/data.csv', CSVWithNames);
+INSERT INTO t SELECT * FROM s3('https://bucket/*.parquet', 'key', 'secret', 'Parquet');</pre>
+
+<h3>ClickHouse batches internally too</h3>
+<p>The 43M-row load in Lesson 2 was a single statement, but it produced <b>39 parts</b> — ClickHouse split the
+stream at <code>max_insert_block_size</code> (about 1 million rows), sorted and wrote each block, then merged
+them down to 4 in the background. Memory stayed flat the whole time.</p>
+
+<!-- ===================== 7 ===================== -->
+<div class="lesson"></div>
+<h2><span class="step">7</span> Updates and deletes</h2>
+
+<p>This is where ClickHouse is least like a normal database. Parts are <b>immutable</b> — once written, never
+edited. So an UPDATE cannot change rows in place.</p>
+
+<h3>What actually happens</h3>
+<pre>ALTER TABLE t UPDATE salary = salary * 1.1 WHERE dept = 'eng';
+        |
+        v
+  queued as a MUTATION (a text file on disk)
+        |
+        v
+  background: read part -> apply change -> write NEW part -> drop old</pre>
+
+<p>The statement returns <b>immediately</b>. The work happens later. Updating one row can rewrite gigabytes.</p>
+
+<div class="warn"><b>Mutations are async, have no rollback, and no transaction.</b> Your next SELECT may
+still show old values. Force it to wait:
+<pre>ALTER TABLE t UPDATE x = 1 WHERE y = 2 SETTINGS mutations_sync = 1;</pre></div>
+
+<h3>Deletes — use the lightweight one</h3>
+<pre>DELETE FROM t WHERE id = 1;              -- lightweight, cheap, use this
+ALTER TABLE t DELETE WHERE id = 1;       -- heavyweight mutation, avoid</pre>
+<p>Lightweight delete just flags rows in a hidden <code>_row_exists</code> column. Physical removal waits for
+a merge.</p>
+
+<h3>Clearing a column</h3>
+<pre>ALTER TABLE t CLEAR COLUMN email;                        -- values -> default, rows KEPT
+ALTER TABLE t CLEAR COLUMN email IN PARTITION '202301';  -- one partition only</pre>
+<p>Useful for GDPR erasure while keeping the schema. The <code>IN PARTITION</code> form limits the rewrite —
+on a big table that is the difference between seconds and hours.</p>
+
+<h3>The idiomatic alternative: don't update</h3>
+<pre>CREATE TABLE state (id String, status String, ver DateTime)
+ENGINE = ReplacingMergeTree(ver) ORDER BY id;
+
+INSERT INTO state VALUES ('d1', 'active',  now());
+INSERT INTO state VALUES ('d1', 'retired', now());   -- "update" = an append
+
+SELECT * FROM state FINAL;   -- returns only the latest</pre>
+<div class="why">Appends are cheap. Mutations are not. Use mutations for occasional backfills and GDPR
+deletes — never as your routine update path.</div>
+
+<h3>Monitoring mutations</h3>
+<pre>SELECT command, is_done, parts_to_do, latest_fail_reason
+FROM system.mutations WHERE NOT is_done;
+
+KILL MUTATION WHERE mutation_id = '...';    -- no rollback: leaves it half-applied</pre>
+
+<!-- ===================== 8 ===================== -->
+<div class="lesson"></div>
+<h2><span class="step">8</span> Materialized views</h2>
+
+<div class="why"><b>A ClickHouse materialized view is an INSERT TRIGGER, not a cached query.</b><br>
+It fires on rows inserted <b>after</b> it is created. It never sees existing data and never re-reads the
+source table. That is why it is cheap.</div>
+
+<h3>The production pattern — three steps</h3>
+<pre>-- 1. target table holds the data
+CREATE TABLE towers_by_mcc (
+    mcc UInt16, radio Enum8(...), yr UInt16,
+    towers UInt64, range_sum UInt64
+) ENGINE = SummingMergeTree ORDER BY (mcc, radio, yr);
+
+-- 2. the MV is just the trigger
+CREATE MATERIALIZED VIEW mv_by_mcc TO towers_by_mcc AS
+SELECT mcc, radio, toYear(created) AS yr, count() AS towers, sum(range) AS range_sum
+FROM cell_towers GROUP BY mcc, radio, yr;
+
+-- 3. backfill existing rows manually
+INSERT INTO towers_by_mcc
+SELECT mcc, radio, toYear(created), count(), sum(range)
+FROM cell_towers GROUP BY mcc, radio, toYear(created);</pre>
+
+<h3>Measured result</h3>
+<table>
+<tr><th></th><th>Base table</th><th>Rollup via MV</th><th>Gain</th></tr>
+<tr><td>Rows</td><td>43,276,150</td><td><b>5,907</b></td><td>7,300&times; fewer</td></tr>
+<tr><td>Size</td><td>896 MiB</td><td><b>54 KiB</b></td><td>17,000&times; smaller</td></tr>
+<tr><td>Query time</td><td>0.045 s</td><td><b>0.002 s</b></td><td><b>22&times; faster</b></td></tr>
+</table>
+
+<h3>Rules</h3>
+<table>
+<tr><td>Always use <code>TO target_table</code></td><td>Lets you drop and recreate the MV without losing data</td></tr>
+<tr><td>Backfill manually</td><td><code>POPULATE</code> misses rows inserted while it runs</td></tr>
+<tr><td><code>SummingMergeTree</code> for sums/counts</td><td>Merges duplicate keys automatically</td></tr>
+<tr><td><code>AggregatingMergeTree</code> for uniq/avg/quantile</td><td>Those are not summable</td></tr>
+</table>
+
+<h3>Non-summable aggregates</h3>
+<pre>-- write with -State
+CREATE MATERIALIZED VIEW mv TO agg AS
+SELECT day, uniqState(user_id) AS users, avgState(price) AS avg_price
+FROM events GROUP BY day;
+
+-- read with -Merge
+SELECT day, uniqMerge(users), avgMerge(avg_price) FROM agg GROUP BY day;</pre>
+<p class="small">Mixing up <code>-State</code> and <code>-Merge</code> returns binary garbage, not an error.</p>
+
+<h3>MVs chain</h3>
+<pre>Kafka table  ->  MV (parse JSON)  ->  events  ->  MV  ->  hourly  ->  MV  ->  daily</pre>
+<p>Raw data lands once; every rollup is maintained automatically on insert. This replaces scheduled refresh
+jobs entirely.</p>
+
+<!-- ===================== 9 ===================== -->
+<div class="lesson"></div>
+<h2><span class="step">9</span> Compression</h2>
+
+<p>ClickHouse compresses per column. Default is LZ4 — fast, moderate ratio. You can pick a specialised codec
+per column.</p>
+
+<h3>The codecs worth knowing</h3>
+<table>
+<tr><th>Codec</th><th>For</th></tr>
+<tr><td><code>T64</code></td><td>Integers that don't use their full range. Strips unused high bits.</td></tr>
+<tr><td><code>Delta</code>, <code>DoubleDelta</code></td><td>Sorted timestamps, counters, monotonic values</td></tr>
+<tr><td><code>Gorilla</code></td><td>Floats that change slowly (sensor readings)</td></tr>
+<tr><td><code>ZSTD(1..22)</code></td><td>General purpose. Apply <b>after</b> a specialised codec.</td></tr>
+<tr><td><code>LowCardinality(String)</code></td><td>Not a codec — a type. Use under ~10k distinct values.</td></tr>
+</table>
+
+<h3>Measured on the 43M-row table</h3>
+<pre>samples UInt32   CODEC(T64, ZSTD(1))          77.2 MiB -> 21.7 MiB    71.9% saved
+cell    UInt64   CODEC(T64, ZSTD(1))         178.7 MiB -> 108.2 MiB   39.5%
+created DateTime CODEC(DoubleDelta, ZSTD(1))  87.9 MiB -> 54.3 MiB    38.2%
+lat     Float64  CODEC(Gorilla, ZSTD(1))     260.1 MiB -> 247.9 MiB    4.7%
+updated DateTime CODEC(DoubleDelta, ZSTD(1)) 131.1 MiB -> 135.7 MiB   -3.5%  &lt;- WORSE
+
+Table total: 1.07 GiB -> 896 MiB   (ratio 1.81 -> 2.22)</pre>
+
+<div class="warn"><b>Why <code>updated</code> got worse.</b> <code>created</code> is in <code>ORDER BY</code>,
+so it is stored sorted — consecutive deltas are tiny. <code>updated</code> is not sorted, so consecutive values
+jump randomly and the deltas are <i>larger</i> than the raw values.
+<br><br>
+<b>Rule: Delta / DoubleDelta / Gorilla only pay off on columns correlated with the sort order.</b>
+<code>T64</code> works regardless, which is why it won everywhere.</div>
+
+<h3>Check your own table</h3>
+<pre>SELECT name,
+       formatReadableSize(sum(data_compressed_bytes))   AS compressed,
+       formatReadableSize(sum(data_uncompressed_bytes)) AS uncompressed,
+       round(sum(data_uncompressed_bytes) / sum(data_compressed_bytes), 2) AS ratio
+FROM system.columns WHERE table = 'cell_towers'
+GROUP BY name ORDER BY sum(data_compressed_bytes) DESC;</pre>
+<p>Start with the biggest column. That is where the win is.</p>
+
+<!-- ===================== 10 ===================== -->
+<div class="lesson"></div>
+<h2><span class="step">10</span> Skip indexes and projections</h2>
+
+<p>Both solve the same problem: <b>you need to filter on a column that is not in <code>ORDER BY</code></b>.</p>
+
+<h3>Skip index — cheap, partial help</h3>
+<pre>ALTER TABLE cell_towers ADD INDEX idx_lat lat TYPE minmax GRANULARITY 4;
+ALTER TABLE cell_towers MATERIALIZE INDEX idx_lat;   -- required for existing data</pre>
+<div class="out">Skip
+  Name: idx_lat
+  Description: minmax GRANULARITY 4
+  Granules: 1948/5283          &lt;-- 63% skipped</div>
+
+<table>
+<tr><th>Type</th><th>For</th></tr>
+<tr><td><code>minmax</code></td><td>Range filters (<code>BETWEEN</code>, <code>&gt;</code>, <code>&lt;</code>)</td></tr>
+<tr><td><code>set(N)</code></td><td>Equality on low-cardinality columns</td></tr>
+<tr><td><code>bloom_filter(p)</code></td><td>Equality on high-cardinality columns</td></tr>
+<tr><td><code>tokenbf_v1</code></td><td>Text search inside strings</td></tr>
+</table>
+
+<div class="warn">Skip indexes only <b>skip</b> — they never point at rows. On randomly distributed data they
+do nothing, because every block's min/max spans the whole range. They worked here because geography clusters
+naturally.</div>
+
+<h3>Projection — a second copy, differently sorted</h3>
+<pre>ALTER TABLE cell_towers ADD PROJECTION proj_geo (SELECT * ORDER BY lat, lon);
+ALTER TABLE cell_towers MATERIALIZE PROJECTION proj_geo;</pre>
+<p>Now the same query silently reads the projection instead:</p>
+<div class="out">ReadFromMergeTree (proj_geo)
+  Granules: 222/5284           &lt;-- 96% skipped</div>
+
+<h3>Measured — same query, three ways</h3>
+<table>
+<tr><th>Strategy</th><th>Granules read</th><th>Time</th><th>Speedup</th></tr>
+<tr><td>Baseline (nothing)</td><td>5284 / 5284</td><td>0.206 s</td><td>1&times;</td></tr>
+<tr><td>Skip index (minmax)</td><td>1948 / 5283</td><td>0.033 s</td><td><b>6&times;</b></td></tr>
+<tr><td>Projection</td><td>222 / 5284</td><td>0.015 s</td><td><b>14&times;</b></td></tr>
+</table>
+
+<h3>Aggregating projection — the biggest win</h3>
+<pre>ALTER TABLE cell_towers ADD PROJECTION proj_mcc
+  (SELECT mcc, radio, count(), avg(range) GROUP BY mcc, radio);</pre>
+<div class="out">GROUP BY mcc, radio     base table: 0.063 s     projection: 0.002 s    31x faster</div>
+
+<div class="why"><b>Which to use.</b> Skip index is nearly free but only helps clustered data. A projection is
+a full second copy of the table (1.12 GiB here) but gives far better skipping. <b>Aggregating</b> projections
+are the best deal: a few MB for a 31&times; win.</div>
+
+<!-- ===================== 11 ===================== -->
+<div class="lesson"></div>
+<h2><span class="step">11</span> SQL you won't find elsewhere</h2>
+
+<h3>Top-N per group, no window function</h3>
+<pre>SELECT * FROM events ORDER BY score DESC LIMIT 3 BY user_id;</pre>
+<p>Cheaper and shorter than <code>row_number() OVER (PARTITION BY ...)</code>.</p>
+
+<h3>The -If combinator</h3>
+<pre>SELECT countIf(status = 'error')      AS errors,
+       avgIf(latency, status = 'ok')  AS ok_latency,
+       sumIf(amount, country = 'US')  AS us_revenue
+FROM events;</pre>
+<p>All computed in one pass. Replaces <code>SUM(CASE WHEN ... END)</code>.</p>
+
+<h3>argMax / argMin</h3>
+<pre>SELECT argMax(product_name, revenue) FROM sales;   -- the name from the highest-revenue row</pre>
+<p>Replaces a self-join or a window function.</p>
+
+<h3>Approximate aggregates</h3>
+<pre>SELECT uniq(user_id),                     -- HyperLogLog, ~0.5% error, very fast
+       uniqExact(user_id),                -- exact, slower
+       quantile(0.95)(latency),           -- approximate percentile
+       quantiles(0.5, 0.9, 0.99)(latency) -- several in one pass
+FROM events;</pre>
+
+<h3>Time bucketing</h3>
+<pre>toStartOfHour(ts)          toStartOfDay(ts)         toStartOfMonth(ts)
+toStartOfInterval(ts, INTERVAL 5 MINUTE)
+toYear(ts)  toMonth(ts)  toDayOfWeek(ts)  toHour(ts)</pre>
+
+<h3>Arrays</h3>
+<pre>SELECT arrayJoin([1,2,3]);                       -- explode into rows
+SELECT groupArray(user_id) FROM events;          -- collect into an array
+SELECT arrayMap(x -> x * 2, [1,2,3]);            -- [2,4,6]
+SELECT arrayFilter(x -> x > 1, [1,2,3]);         -- [2,3]</pre>
+
+<h3>Gap filling</h3>
+<pre>SELECT toStartOfDay(ts) AS day, count()
+FROM events GROUP BY day ORDER BY day
+WITH FILL FROM toDate('2026-01-01') TO toDate('2026-02-01') STEP INTERVAL 1 DAY;</pre>
+<p>Inserts rows for days with no data — no calendar table needed.</p>
+
+<h3>Case sensitivity</h3>
+<table>
+<tr><td>Keywords (<code>SeLeCt</code>)</td><td>case-<b>in</b>sensitive</td></tr>
+<tr><td>Column / table / database names</td><td><b>case-sensitive</b></td></tr>
+<tr><td>Function names (<code>toYear</code>)</td><td><b>case-sensitive</b>, camelCase</td></tr>
+<tr><td>Aggregate names (<code>count</code>, <code>SUM</code>)</td><td>case-insensitive (SQL standard)</td></tr>
+</table>
+
+<!-- ===================== 12 ===================== -->
+<div class="lesson"></div>
+<h2><span class="step">12</span> Scaling and production</h2>
+
+<h3>Scale vertically first</h3>
+<div class="why">Unlike Spark, ClickHouse is <b>single-node by default and that is usually enough</b>. There is
+no shuffle — a GROUP BY streams blocks through vectorised operators and merges hash tables locally. Most
+production deployments never shard.
+<br><br>
+&lt; 1 TB: single node. 1&ndash;10 TB: still single node. 10 TB+: consider sharding.</div>
+
+<h3>The scaling ladder — in order</h3>
+<table>
+<tr><td>1</td><td><b>Fix ORDER BY</b></td><td>Free. Usually the entire problem.</td></tr>
+<tr><td>2</td><td><b>Codecs, MVs, projections</b></td><td>10&ndash;30&times;, no new hardware</td></tr>
+<tr><td>3</td><td><b>Bigger machine</b></td><td>Scales near-linearly with cores</td></tr>
+<tr><td>4</td><td><b>Add replicas</b></td><td>Fixes concurrency — usually the real bottleneck</td></tr>
+<tr><td>5</td><td><b>Tier cold data to S3</b></td><td>Often defers sharding indefinitely</td></tr>
+<tr><td>6</td><td><b>Shard</b></td><td>Last resort. Hard to undo.</td></tr>
+</table>
+
+<h3>Replicas vs shards — different problems</h3>
+<pre>REPLICAS  -> same data, N copies   -> more concurrent READS + high availability
+SHARDS    -> different data, split -> more DATA than one node can hold</pre>
+<p>If 500 dashboard users are slow, you need <b>replicas</b>. If 40 TB won't fit, you need <b>shards</b>.</p>
+
+<h3>Tiering to S3 — the step most people skip</h3>
+<pre>ALTER TABLE events MODIFY TTL event_date + INTERVAL 90 DAY TO VOLUME 's3';</pre>
+<p>Hot 90 days on NVMe, history on S3, one table, no sharding. For most workloads this replaces sharding
+entirely.</p>
+
+<h3>Concurrency tuning</h3>
+<pre>SET max_threads = 4,               -- one query won't eat all cores
+    max_execution_time = 10,
+    max_memory_usage = 10000000000;</pre>
+<p>By default one query uses every core. For dashboards, cap it — you trade single-query latency for
+concurrent throughput. This is the setting that makes hundreds of users work.</p>
+
+<h3>Monitoring — the queries to keep</h3>
+<pre>-- storage per table
+SELECT table, formatReadableSize(sum(data_compressed_bytes)) AS size,
+       sum(rows) AS rows, count() AS parts
+FROM system.parts WHERE active GROUP BY table ORDER BY sum(bytes_on_disk) DESC;
+
+-- stuck mutations
+SELECT command, parts_to_do, latest_fail_reason
+FROM system.mutations WHERE NOT is_done;
+
+-- in-flight merges
+SELECT table, elapsed, progress FROM system.merges;</pre>
+
+<h3>The 10 traps, collected</h3>
+<table>
+<tr><td>1</td><td><code>ORDER BY</code> is the index. It decides everything, and can't be changed later.</td></tr>
+<tr><td>2</td><td><code>ReplacingMergeTree</code> dedup is eventual — you need <code>FINAL</code>.</td></tr>
+<tr><td>3</td><td><code>UPDATE</code>/<code>DELETE</code> are async mutations that rewrite parts. No rollback.</td></tr>
+<tr><td>4</td><td>Small inserts create parts. Batch, or use <code>async_insert</code>.</td></tr>
+<tr><td>5</td><td>A materialized view never sees existing data. Backfill manually.</td></tr>
+<tr><td>6</td><td>Over-partitioning is worse than none. Monthly or daily only.</td></tr>
+<tr><td>7</td><td><code>SELECT</code> from a Kafka engine table <b>consumes</b> the messages.</td></tr>
+<tr><td>8</td><td>Joins are weak. Use dictionaries or denormalise.</td></tr>
+<tr><td>9</td><td>Delta/Gorilla codecs backfire on unsorted columns.</td></tr>
+<tr><td>10</td><td>No transactions, no foreign keys, no constraints. It is OLAP.</td></tr>
+</table>
+
+<h3>Where to go next</h3>
+<ul>
+<li>Load your own data and run <code>EXPLAIN indexes=1</code> on your slowest query</li>
+<li>Build one materialized view for your most-run dashboard query</li>
+<li>Check <code>system.columns</code> for your biggest column and try a codec on it</li>
+<li>Official docs: <code>clickhouse.com/docs</code> — the SQL reference is genuinely good</li>
+</ul>
+
+<p class="small" style="margin-top:16pt; border-top:1px solid #ccc; padding-top:6pt">
+All timings measured on a MacBook Air (M-series), ClickHouse 26.8.1, against the OpenCelliD dataset
+(43,276,150 rows). Your numbers will differ; the ratios will not.
+</p>

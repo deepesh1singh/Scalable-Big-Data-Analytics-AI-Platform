@@ -1,0 +1,763 @@
+<meta charset="utf-8">
+<title>Real-Time Analytics Platform — System Design</title>
+<style>
+  @page { size: A4; margin: 14mm 13mm; }
+  body { font-family: -apple-system, "Helvetica Neue", Arial, sans-serif;
+         font-size: 10.2pt; line-height: 1.5; color: #16181d; margin: 0; }
+  h1 { font-size: 22pt; margin: 0 0 5pt; letter-spacing: -0.5pt; }
+  h2 { font-size: 15pt; margin: 0 0 8pt; padding: 5pt 0;
+       border-bottom: 2.5px solid #2563eb; page-break-after: avoid; }
+  h3 { font-size: 11.4pt; margin: 13pt 0 4pt; color: #0b3d6b; page-break-after: avoid; }
+  h4 { font-size: 10.3pt; margin: 9pt 0 3pt; color: #333; page-break-after: avoid; }
+  p { margin: 5pt 0; }
+  ul, ol { margin: 5pt 0; padding-left: 17pt; }
+  li { margin: 2.5pt 0; }
+  code { font-family: "SF Mono", Menlo, monospace; font-size: 8.6pt;
+         background: #eef1f5; padding: 0.5pt 3pt; border-radius: 2px; }
+  pre { font-family: "SF Mono", Menlo, monospace; font-size: 8.1pt; line-height: 1.45;
+        background: #f6f8fa; border: 1px solid #d8dee4; border-left: 3px solid #2563eb;
+        border-radius: 3px; padding: 7pt 9pt; white-space: pre-wrap;
+        page-break-inside: avoid; margin: 6pt 0; }
+  table { border-collapse: collapse; width: 100%; font-size: 8.8pt; margin: 6pt 0;
+          page-break-inside: avoid; }
+  th, td { border: 1px solid #c9d1d9; padding: 4pt 6pt; text-align: left; vertical-align: top; }
+  th { background: #eaeef2; font-weight: 600; }
+  .pg { page-break-before: always; }
+  .warn { background: #fdeeee; border-left: 3px solid #c62828; border: 1px solid #e0b4b4;
+          padding: 7pt 9pt; margin: 7pt 0; font-size: 9.4pt; page-break-inside: avoid; }
+  .why { background: #eef7ee; border-left: 3px solid #2e7d32; border: 1px solid #b9d9b9;
+         padding: 7pt 9pt; margin: 7pt 0; font-size: 9.4pt; page-break-inside: avoid; }
+  .num { background: #eef2fb; border-left: 3px solid #2563eb; border: 1px solid #b7c4e2;
+         padding: 7pt 9pt; margin: 7pt 0; font-size: 9.4pt; page-break-inside: avoid; }
+  .cover { border: 3px solid #16181d; padding: 16pt; margin-bottom: 10pt; }
+  .small { font-size: 8.8pt; color: #444; }
+  svg { display: block; margin: 8pt auto; max-width: 100%; }
+  .cap { text-align: center; font-size: 8.3pt; color: #666; font-style: italic; margin-top: -3pt; }
+  .sec { display: inline-block; background: #16181d; color: #60a5fa; font-weight: 700;
+         padding: 1pt 8pt; border-radius: 3px; font-size: 10pt; margin-right: 6pt; }
+</style>
+
+<div class="cover">
+<h1>Real-Time Analytics Platform</h1>
+<p class="small" style="margin-top:2pt"><b>End-to-end system design.</b> Device telemetry → customer-facing
+analytics. Kafka · Flink · S3 Tables (Iceberg) · ClickHouse — replacing Redshift.</p>
+<table>
+<tr><th style="width:20%">Problem</th><td>Ingest ~7B device events/day, derive trips and safety events, serve
+multi-tenant customer dashboards at sub-second latency.</td></tr>
+<tr><th>Today</th><td>Kafka → Flink → S3/Iceberg → Glue → <b>Redshift Spectrum → materialized views</b> → GraphQL</td></tr>
+<tr><th>Target</th><td>Same pipeline, <b>ClickHouse replaces Redshift</b> for serving. S3 Tables remains the
+system of record.</td></tr>
+<tr><th>Key decision</th><td>Query Iceberg <i>in place</i> from ClickHouse (Option A), or <b>materialise into
+MergeTree</b> (Option B). Section 9 resolves it.</td></tr>
+</table>
+</div>
+
+<h3>Contents</h3>
+<table>
+<tr><td style="width:6%"><b>1</b></td><td>Requirements &amp; scope</td>
+    <td style="width:6%"><b>8</b></td><td>Serving layer — ClickHouse</td></tr>
+<tr><td><b>2</b></td><td>Capacity estimation</td><td><b>9</b></td><td>The Option A / B decision</td></tr>
+<tr><td><b>3</b></td><td>High-level architecture</td><td><b>10</b></td><td>API &amp; multi-tenancy</td></tr>
+<tr><td><b>4</b></td><td>Data model</td><td><b>11</b></td><td>Failure modes &amp; recovery</td></tr>
+<tr><td><b>5</b></td><td>Ingestion — Kafka</td><td><b>12</b></td><td>Cost model</td></tr>
+<tr><td><b>6</b></td><td>Processing — Flink</td><td><b>13</b></td><td>Migration plan</td></tr>
+<tr><td><b>7</b></td><td>Storage — S3 Tables / Iceberg</td><td><b>14</b></td><td>Trade-offs &amp; alternatives</td></tr>
+</table>
+
+<div class="why"><b>The one architectural principle.</b> <b>Flink owns all business logic. ClickHouse only
+reshapes for serving.</b> If both systems independently derive a metric, the definitions will drift — not
+immediately, but the first time someone changes one and forgets the other. A customer finds it before your
+tests do.</div>
+
+<!-- ============ 1 ============ -->
+<div class="pg"></div>
+<h2><span class="sec">1</span> Requirements &amp; scope</h2>
+
+<h3>Functional</h3>
+<table>
+<tr><td style="width:6%">F1</td><td>Ingest device telemetry — GPS, speed, accelerometer, diagnostics — from a fleet of connected vehicles</td></tr>
+<tr><td>F2</td><td>Derive <b>trips</b> (start/end, distance, duration, route) from raw point events</td></tr>
+<tr><td>F3</td><td>Derive <b>safety events</b> — harsh braking, speeding, cornering — with severity scoring</td></tr>
+<tr><td>F4</td><td>Enrich with vehicle, driver and company metadata</td></tr>
+<tr><td>F5</td><td>Serve per-tenant dashboards: fleet summary, driver scorecards, trip history, safety trends</td></tr>
+<tr><td>F6</td><td>Support ad-hoc analytical queries by internal analysts</td></tr>
+<tr><td>F7</td><td>Retain raw events for replay and audit</td></tr>
+</table>
+
+<h3>Non-functional — the numbers that drive the design</h3>
+<table>
+<tr><th style="width:22%">Requirement</th><th style="width:20%">Target</th><th>Why it matters</th></tr>
+<tr><td><b>Dashboard latency</b></td><td><b>p99 &lt; 500 ms</b></td><td>Customer-facing. This single number rules out querying object storage per request.</td></tr>
+<tr><td><b>Concurrency</b></td><td>200 concurrent queries peak</td><td>5,000 tenants, business-hours skew</td></tr>
+<tr><td><b>Data freshness</b></td><td>Refined ≤ 3 min · serving ≤ 10 min</td><td>Must be published, not implied</td></tr>
+<tr><td><b>Ingest throughput</b></td><td>250K events/sec peak</td><td>3× average</td></tr>
+<tr><td><b>Availability</b></td><td>99.9% serving</td><td>~43 min/month budget</td></tr>
+<tr><td><b>Retention</b></td><td>Raw 13 months · refined 7 years</td><td>Regulatory and contractual</td></tr>
+<tr><td><b>Correctness</b></td><td>Exactly-once to the lake</td><td>Duplicated safety events are a customer-visible defect</td></tr>
+</table>
+
+<h3>Explicitly out of scope</h3>
+<ul>
+<li>Real-time alerting on individual events (sub-second) — a separate path off Kafka, not this pipeline</li>
+<li>ML model training — reads the same lake, different consumer</li>
+<li>Device firmware, connectivity, and the ingest edge itself</li>
+</ul>
+
+<div class="num"><b>The requirement that decides the architecture: p99 &lt; 500 ms at 200 concurrent.</b>
+Every subsequent choice — MergeTree over in-place Iceberg queries, the ORDER BY key, the materialized
+views — descends from this one line.</div>
+
+<!-- ============ 2 ============ -->
+<div class="pg"></div>
+<h2><span class="sec">2</span> Capacity estimation</h2>
+
+<h3>Ingest volume</h3>
+<pre>Active devices                          200,000
+Emission rate                           1 event / second while active
+Active hours per device per day         10
+
+Events per day    = 200,000 × 10 × 3,600           = 7.2 billion
+Average rate      = 7.2e9 / 86,400                 = 83,000 events/sec
+Peak rate (3×)                                     = 250,000 events/sec</pre>
+
+<h3>Storage</h3>
+<pre>Raw event, JSON on the wire                        ~500 bytes
+Raw event, Parquet + ZSTD in the lake              ~80 bytes   (6× compression)
+
+Raw per day    = 7.2e9 × 80 B                      = 576 GB/day
+Raw per year                                       = 210 TB/year
+Raw retention 13 months                            ≈ 228 TB
+
+Trips per day  = 200,000 devices × 4 trips         = 800,000 rows/day
+Trip row (enriched)                                ~400 bytes
+Trips per day                                      = 320 MB/day
+Trips per year                                     = 117 GB/year        <- tiny
+
+Safety events  ≈ 2% of trips × 3 events            = 48,000 rows/day
+Refined layer total                                ≈ 130 GB/year</pre>
+
+<div class="why"><b>The crucial ratio: raw is 210 TB/year, refined is 130 GB/year — a 1,600× reduction.</b>
+This is the single most important number in the design. It means the <i>serving</i> layer never touches the
+raw volume, and ClickHouse only ever holds gigabytes, not terabytes. A single node is genuinely sufficient.</div>
+
+<h3>Serving layer sizing</h3>
+<pre>ClickHouse holds 90 days of refined + rollups
+  Trips           90 × 320 MB                       = 29 GB
+  Safety events                                     = 3 GB
+  Materialized view rollups (hourly, daily)         = 5 GB
+  ─────────────────────────────────────────────────────────
+  Working set                                       ≈ 37 GB    -> fits in RAM
+
+Query load
+  Tenants                                           5,000
+  Peak concurrent queries                           200
+  Queries per dashboard load                        ~6
+  Peak QPS                                          ~1,200
+  Target p99                                        500 ms</pre>
+
+<h3>Kafka sizing</h3>
+<pre>Peak throughput  250,000 × 500 B                   = 125 MB/sec
+Retention 7 days (replay window)
+Storage  = 125 MB/s × 86,400 × 7 × 3 (replication) = ~226 TB
+  -> use tiered storage: 24h hot on disk, rest to S3
+
+Partitions: target ~10 MB/s per partition           = 32 partitions minimum
+            round up for headroom and consumer parallelism
+                                                    -> 64 partitions</pre>
+
+<div class="num"><b>Sanity check the whole thing.</b> 7.2B events/day is large. 130 GB/year of refined data
+is small. <b>The pipeline's entire job is that reduction.</b> If the serving layer is ever asked to scan raw
+volume, the design has failed — that is exactly the trap Option A (querying Iceberg in place) walks into.</div>
+
+<!-- ============ 3 ============ -->
+<div class="pg"></div>
+<h2><span class="sec">3</span> High-level architecture</h2>
+
+<svg viewBox="0 0 720 470" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial" font-size="8.6">
+  <defs>
+    <marker id="a" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#455a64"/></marker>
+    <marker id="ab" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#2563eb"/></marker>
+  </defs>
+
+  <!-- devices -->
+  <rect x="12" y="180" width="84" height="70" rx="6" fill="#eceff1" stroke="#607d8b" stroke-width="1.8"/>
+  <text x="54" y="204" text-anchor="middle" font-size="9.6" font-weight="bold" fill="#37474f">DEVICES</text>
+  <text x="54" y="220" text-anchor="middle" fill="#555">200K vehicles</text>
+  <text x="54" y="234" text-anchor="middle" fill="#555">1 event/sec</text>
+  <line x1="96" y1="215" x2="122" y2="215" stroke="#455a64" stroke-width="2" marker-end="url(#a)"/>
+
+  <!-- kafka -->
+  <rect x="124" y="168" width="96" height="94" rx="6" fill="#f3e8fd" stroke="#7e3ff2" stroke-width="2.2"/>
+  <text x="172" y="190" text-anchor="middle" font-size="9.8" font-weight="bold" fill="#4c1d95">KAFKA</text>
+  <text x="172" y="207" text-anchor="middle" fill="#555">64 partitions</text>
+  <text x="172" y="221" text-anchor="middle" fill="#555">key = device_id</text>
+  <text x="172" y="235" text-anchor="middle" fill="#555">7-day retention</text>
+  <text x="172" y="252" text-anchor="middle" font-size="8" fill="#7e3ff2">250K/s peak</text>
+  <line x1="220" y1="215" x2="246" y2="215" stroke="#455a64" stroke-width="2" marker-end="url(#a)"/>
+
+  <!-- flink -->
+  <rect x="248" y="150" width="112" height="130" rx="6" fill="#fff3e0" stroke="#e65100" stroke-width="2.2"/>
+  <text x="304" y="172" text-anchor="middle" font-size="9.8" font-weight="bold" fill="#bf360c">FLINK</text>
+  <text x="304" y="188" text-anchor="middle" fill="#555">dedupe · validate</text>
+  <text x="304" y="202" text-anchor="middle" fill="#555">sessionise → trips</text>
+  <text x="304" y="216" text-anchor="middle" fill="#555">safety detection</text>
+  <text x="304" y="230" text-anchor="middle" fill="#555">enrich (broadcast)</text>
+  <text x="304" y="248" text-anchor="middle" font-size="8" fill="#bf360c">keyBy device_id</text>
+  <text x="304" y="262" text-anchor="middle" font-size="8" fill="#bf360c">RocksDB state</text>
+  <text x="304" y="274" text-anchor="middle" font-size="7.6" fill="#999">30s checkpoints</text>
+
+  <line x1="360" y1="185" x2="392" y2="150" stroke="#455a64" stroke-width="2" marker-end="url(#a)"/>
+  <line x1="360" y1="240" x2="392" y2="268" stroke="#455a64" stroke-width="2" marker-end="url(#a)"/>
+
+  <!-- S3 raw -->
+  <rect x="394" y="112" width="132" height="62" rx="6" fill="#fff8ee" stroke="#FF9900" stroke-width="2"/>
+  <text x="460" y="132" text-anchor="middle" font-size="9.4" font-weight="bold" fill="#8a5200">S3 — BRONZE</text>
+  <text x="460" y="147" text-anchor="middle" fill="#666">raw events, Iceberg</text>
+  <text x="460" y="161" text-anchor="middle" fill="#666">576 GB/day · 13 mo</text>
+
+  <!-- S3 refined -->
+  <rect x="394" y="240" width="132" height="72" rx="6" fill="#fff8ee" stroke="#FF9900" stroke-width="2.6"/>
+  <text x="460" y="260" text-anchor="middle" font-size="9.4" font-weight="bold" fill="#8a5200">S3 — SILVER</text>
+  <text x="460" y="275" text-anchor="middle" fill="#666">trips · safety events</text>
+  <text x="460" y="289" text-anchor="middle" fill="#666">Iceberg · 130 GB/yr</text>
+  <text x="460" y="304" text-anchor="middle" font-size="8" font-weight="bold" fill="#8a5200">SYSTEM OF RECORD</text>
+
+  <!-- glue -->
+  <rect x="394" y="326" width="132" height="42" rx="5" fill="#f3e8fd" stroke="#7e3ff2" stroke-width="1.6"/>
+  <text x="460" y="344" text-anchor="middle" font-size="9" font-weight="bold" fill="#4c1d95">Glue Catalog</text>
+  <text x="460" y="358" text-anchor="middle" font-size="7.8" fill="#666">schemas · snapshots</text>
+  <line x1="460" y1="312" x2="460" y2="322" stroke="#7e3ff2" stroke-width="1.6" marker-end="url(#a)"/>
+
+  <!-- incremental load -->
+  <line x1="526" y1="276" x2="558" y2="276" stroke="#2563eb" stroke-width="2.4" marker-end="url(#ab)"/>
+  <rect x="536" y="248" width="108" height="24" rx="4" fill="#eef2fb" stroke="#2563eb" stroke-width="1.4"/>
+  <text x="590" y="264" text-anchor="middle" font-size="8" fill="#1e40af">incremental load</text>
+  <text x="590" y="292" text-anchor="middle" font-size="7.4" fill="#666">snapshot watermark, 5 min</text>
+
+  <!-- clickhouse -->
+  <rect x="560" y="150" width="148" height="94" rx="6" fill="#fff8e1" stroke="#F5C000" stroke-width="2.6"/>
+  <text x="634" y="172" text-anchor="middle" font-size="9.8" font-weight="bold" fill="#3a2c00">CLICKHOUSE</text>
+  <text x="634" y="188" text-anchor="middle" fill="#555">MergeTree · 90 days</text>
+  <text x="634" y="202" text-anchor="middle" font-size="7.6" font-family="monospace" fill="#555">ORDER BY (company_id, ts)</text>
+  <text x="634" y="216" text-anchor="middle" fill="#555">materialized views</text>
+  <text x="634" y="234" text-anchor="middle" font-size="8" font-weight="bold" fill="#8a6d00">37 GB · fits in RAM</text>
+  <line x1="612" y1="248" x2="620" y2="248" stroke="#2563eb" stroke-width="0"/>
+  <path d="M 600 248 L 620 246" fill="none" stroke="#2563eb" stroke-width="2.2" marker-end="url(#ab)"/>
+
+  <!-- API -->
+  <rect x="560" y="46" width="148" height="76" rx="6" fill="#e8f5e9" stroke="#2e7d32" stroke-width="2"/>
+  <text x="634" y="68" text-anchor="middle" font-size="9.6" font-weight="bold" fill="#1b5e20">API LAYER</text>
+  <text x="634" y="84" text-anchor="middle" fill="#555">GraphQL · Cube</text>
+  <text x="634" y="98" text-anchor="middle" fill="#555">tenant isolation</text>
+  <text x="634" y="112" text-anchor="middle" font-size="8" fill="#1b5e20">p99 &lt; 500 ms</text>
+  <line x1="634" y1="150" x2="634" y2="126" stroke="#455a64" stroke-width="2" marker-end="url(#a)"/>
+
+  <!-- customers -->
+  <rect x="560" y="14" width="148" height="26" rx="5" fill="#f8f9fa" stroke="#888"/>
+  <text x="634" y="31" text-anchor="middle" font-size="8.6" fill="#333">5,000 tenants · 200 concurrent</text>
+  <line x1="634" y1="46" x2="634" y2="42" stroke="#455a64" stroke-width="1.6" marker-end="url(#a)"/>
+
+  <!-- analysts path -->
+  <rect x="248" y="392" width="112" height="46" rx="5" fill="#f3e8fd" stroke="#7e3ff2" stroke-width="1.6"/>
+  <text x="304" y="411" text-anchor="middle" font-size="8.8" font-weight="bold" fill="#4c1d95">Athena / Spark</text>
+  <text x="304" y="427" text-anchor="middle" font-size="7.8" fill="#666">ad-hoc · backfill · ML</text>
+  <path d="M 420 368 C 400 388, 370 400, 364 410" fill="none" stroke="#7e3ff2"
+        stroke-width="1.8" stroke-dasharray="4,3" marker-end="url(#a)"/>
+
+  <!-- redshift being removed -->
+  <rect x="560" y="392" width="148" height="46" rx="5" fill="#f5f5f5" stroke="#bbb" stroke-dasharray="5,3"/>
+  <text x="634" y="411" text-anchor="middle" font-size="8.8" font-weight="bold" fill="#999">Redshift Spectrum</text>
+  <text x="634" y="427" text-anchor="middle" font-size="7.8" fill="#999">migration bridge only</text>
+  <path d="M 526 350 C 552 372, 560 388, 558 404" fill="none" stroke="#bbb"
+        stroke-width="1.6" stroke-dasharray="4,3" marker-end="url(#a)"/>
+
+  <text x="360" y="458" text-anchor="middle" font-size="8.6" fill="#666">
+    Flink owns ALL business logic. ClickHouse only reshapes for serving — it never re-derives a metric.</text>
+</svg>
+<p class="cap">7.2B events/day in · 130 GB/year of refined data out · 37 GB working set in the serving layer.</p>
+
+<!-- ============ 4 ============ -->
+<div class="pg"></div>
+<h2><span class="sec">4</span> Data model</h2>
+
+<h3>Bronze — raw events (Iceberg)</h3>
+<pre>device_events
+  event_id        UUID
+  device_id       STRING          -- Kafka partition key
+  company_id      INT             -- tenant
+  event_time      TIMESTAMP       -- EVENT time, from the device
+  ingest_time     TIMESTAMP       -- when we received it
+  lat, lon        DOUBLE
+  speed_kph       FLOAT
+  accel_x/y/z     FLOAT
+  raw_payload     STRING          -- full original, for replay
+PARTITIONED BY (days(event_time))</pre>
+<p class="small">Append-only, never updated. Partitioned by day for pruning and cheap 13-month expiry.</p>
+
+<h3>Silver — trips (Iceberg, the system of record)</h3>
+<pre>trips
+  trip_id           UUID
+  device_id         STRING
+  company_id        INT
+  driver_id         STRING
+  start_time        TIMESTAMP
+  end_time          TIMESTAMP
+  duration_s        INT
+  distance_km       DOUBLE
+  max_speed_kph     FLOAT
+  avg_speed_kph     FLOAT
+  start_lat/lon     DOUBLE
+  end_lat/lon       DOUBLE
+  safety_score      FLOAT
+  n_harsh_brake     INT
+  n_speeding        INT
+  _version          TIMESTAMP     -- for late-arriving corrections
+PARTITIONED BY (days(start_time))</pre>
+
+<h3>Serving — ClickHouse MergeTree</h3>
+<pre>CREATE TABLE trips_serving
+(
+    company_id      UInt32,
+    start_date      Date,
+    device_id       LowCardinality(String),
+    driver_id       LowCardinality(String),
+    trip_id         UUID,
+    start_time      DateTime64(3)  CODEC(DoubleDelta, ZSTD(1)),
+    duration_s      UInt32         CODEC(T64, ZSTD(1)),
+    distance_km     Float32        CODEC(Gorilla, ZSTD(1)),
+    max_speed_kph   Float32,
+    safety_score    Float32,
+    n_harsh_brake   UInt16         CODEC(T64, ZSTD(1)),
+    _version        DateTime
+)
+ENGINE = ReplacingMergeTree(_version)
+PARTITION BY toYYYYMM(start_date)
+ORDER BY (company_id, start_date, device_id, start_time)
+TTL start_date + INTERVAL 90 DAY;</pre>
+
+<div class="why"><b>Every line of that ORDER BY is a deliberate decision.</b><br>
+<code>company_id</code> <b>first</b> — every customer query filters on it, so the sparse index prunes to
+one tenant's granules immediately. This is the single highest-value choice in the whole serving layer.<br>
+<code>start_date</code> second — the near-universal second filter.<br>
+<code>ReplacingMergeTree(_version)</code> — late corrections arrive as an insert, not an UPDATE. Mutations
+rewrite whole parts; appends are cheap.</div>
+
+<h3>Rollups via materialized view</h3>
+<pre>CREATE TABLE daily_fleet_summary (
+    company_id UInt32, day Date,
+    trips UInt64, total_km Float64, harsh_brakes UInt64,
+    avg_safety AggregateFunction(avg, Float32)
+) ENGINE = SummingMergeTree ORDER BY (company_id, day);
+
+CREATE MATERIALIZED VIEW mv_daily TO daily_fleet_summary AS
+SELECT company_id, start_date AS day,
+       count() AS trips, sum(distance_km) AS total_km,
+       sum(n_harsh_brake) AS harsh_brakes, avgState(safety_score) AS avg_safety
+FROM trips_serving GROUP BY company_id, day;</pre>
+
+<div class="num"><b>Measured on comparable data:</b> a rollup like this reduces 43M rows to ~6K and cuts
+query time from 45 ms to 2 ms — a <b>22× speedup on a table 17,000× smaller</b>. The fleet-summary dashboard
+tile never touches the trip-level table.</div>
+
+<!-- ============ 5 ============ -->
+<div class="pg"></div>
+<h2><span class="sec">5</span> Ingestion — Kafka</h2>
+
+<h3>Topic design</h3>
+<table>
+<tr><th style="width:26%">Decision</th><th style="width:22%">Choice</th><th>Reasoning</th></tr>
+<tr><td>Partition key</td><td><b><code>device_id</code></b></td><td>Guarantees per-device ordering, which trip sessionisation requires. Also makes Flink's <code>keyBy(device_id)</code> a local no-op instead of a network shuffle.</td></tr>
+<tr><td>Partition count</td><td><b>64</b></td><td>250K/s ÷ ~10 MB/s per partition = 32 minimum; 64 gives headroom and consumer parallelism. <b>Effectively permanent</b> — increasing it breaks key affinity.</td></tr>
+<tr><td>Replication</td><td>3, <code>min.insync=2</code></td><td>Survives one broker loss with no data loss</td></tr>
+<tr><td>Retention</td><td>7 days</td><td>The replay window. Longer than the worst realistic outage.</td></tr>
+<tr><td>Producer</td><td><code>acks=all</code>, idempotent</td><td>No duplicates from broker-side retries</td></tr>
+<tr><td>Compression</td><td>zstd</td><td>~4× on JSON telemetry</td></tr>
+</table>
+
+<div class="warn"><b>Partition count is a permanent decision.</b> Increasing partitions changes the
+key→partition mapping, which breaks per-device ordering and corrupts any downstream keyed state. Size for
+peak plus growth on day one.</div>
+
+<h3>Handling device clock skew</h3>
+<p>Devices have unreliable clocks. Carry <b>both</b> timestamps: <code>event_time</code> from the device and
+<code>ingest_time</code> from the broker. Window on event time, but reject events whose
+<code>event_time</code> is more than 24 hours from <code>ingest_time</code> — those are clock faults, not
+late data, and they will otherwise poison your watermarks.</p>
+
+<!-- ============ 6 ============ -->
+<div class="pg"></div>
+<h2><span class="sec">6</span> Processing — Flink</h2>
+
+<h3>The job graph</h3>
+<pre>KafkaSource(device_events)
+   │  watermark: bounded out-of-orderness 2 min, withIdleness 1 min
+   ▼
+Validate + drop clock-fault events            [stateless]
+   ▼
+Deduplicate by event_id, 10-min TTL           [keyed state]
+   ▼
+keyBy(device_id)
+   ├──▶ SessionWindow(gap 5 min) ──▶ Trip aggregation      [large state]
+   └──▶ ProcessFunction ──────────▶ Safety event detection [timers]
+   ▼
+Broadcast join: vehicle + driver + company metadata
+   ▼
+   ├──▶ IcebergSink  bronze (raw passthrough)
+   └──▶ IcebergSink  silver (trips, safety events)</pre>
+
+<h3>State sizing — the number that decides your cluster</h3>
+<pre>Concurrent open trips        200,000 devices × ~25% active   = 50,000
+State per open trip          route points + running aggregates ≈ 8 KB
+Trip session state                                             = 400 MB
+Dedup state  (event_id, 10 min TTL)
+   83,000/s × 600 s × 40 B                                     = 2.0 GB
+Broadcast metadata (vehicles, drivers, companies)              = 200 MB
+────────────────────────────────────────────────────────────────────
+Total keyed state                                              ≈ 2.6 GB</pre>
+
+<div class="why"><b>2.6 GB is comfortably RocksDB territory</b> with incremental checkpointing. Use
+<code>EmbeddedRocksDBStateBackend</code>, not heap — heap state at this size makes checkpoints slow and GC
+pauses visible. Incremental checkpoints mean cost scales with <i>changed</i> keys, not total state.</p></div>
+
+<h3>Configuration that matters</h3>
+<table>
+<tr><td style="width:38%"><code>parallelism</code></td><td>64 — matches Kafka partitions exactly, so the source is a 1:1 assignment</td></tr>
+<tr><td><code>checkpointing.interval</code></td><td>30 s, EXACTLY_ONCE, <b>unaligned</b> — completes even under backpressure</td></tr>
+<tr><td><code>state.backend</code></td><td>RocksDB + incremental checkpoints to S3</td></tr>
+<tr><td><code>watermark</code></td><td>2 min out-of-orderness, <code>withIdleness(1 min)</code></td></tr>
+<tr><td><code>session gap</code></td><td>5 min of no movement ends a trip</td></tr>
+<tr><td>Iceberg sink commit</td><td>Every 60 s — balances file size against freshness</td></tr>
+</table>
+
+<div class="warn"><b><code>withIdleness</code> is not optional.</b> Flink takes the <i>minimum</i> watermark
+across all input partitions. If one Kafka partition goes quiet — a regional outage, a fleet parked
+overnight — the watermark stops advancing, windows never fire, and output silently stops <b>while the job
+reports healthy</b>. It is the most common Flink production incident.</div>
+
+<div class="warn"><b>Trip sessionisation has an unbounded-state failure mode.</b> A device that emits one
+event and then vanishes (crash, connectivity loss) leaves an open session forever. Guard with a
+<b>maximum trip duration timer</b> — force-close and emit any session exceeding 24 hours.</div>
+
+<!-- ============ 7 ============ -->
+<div class="pg"></div>
+<h2><span class="sec">7</span> Storage — S3 Tables / Iceberg</h2>
+
+<h3>Why Iceberg and not plain Parquet</h3>
+<table>
+<tr><th style="width:44%">Plain Parquet folder</th><th>Iceberg table</th></tr>
+<tr><td>"The table" is whatever files are present</td><td>Manifests name exactly which files are current</td></tr>
+<tr><td>A failed write leaves visible garbage</td><td>Atomic commits — readers never see partial writes</td></tr>
+<tr><td>No schema evolution safety</td><td>Column add/rename/reorder without rewriting</td></tr>
+<tr><td>No time travel</td><td>Snapshot isolation and rollback</td></tr>
+<tr><td>Manual compaction</td><td><b>S3 Tables compacts automatically</b></td></tr>
+</table>
+
+<h3>Layout</h3>
+<pre>s3://lake/
+├── bronze/device_events/     partitioned by days(event_time)   576 GB/day
+├── silver/trips/             partitioned by days(start_time)   320 MB/day
+├── silver/safety_events/     partitioned by days(event_time)
+└── gold/daily_metrics/       partitioned by month              small</pre>
+
+<div class="warn"><b>The streaming small-file problem.</b> Flink committing every 60 s with parallelism 64
+produces <b>64 files/minute = 92,000 files/day</b> in bronze. That destroys read performance — listing
+overhead, task overhead, footers exceeding data.<br><br>
+<b>Three mitigations, in order:</b> (1) S3 Tables automatic compaction — the main reason to use it;
+(2) raise the sink commit interval to 2–5 min for bronze where freshness matters less; (3) a scheduled
+compaction job as a backstop.</div>
+
+<h3>Retention and cost management</h3>
+<pre>Bronze     13 months, then expire partitions
+           Lifecycle: Standard → Standard-IA at 30 days → Glacier IR at 90 days
+Silver     7 years, stays in Standard (small, and read constantly)
+Snapshots  expire after 7 days — otherwise metadata grows unbounded
+           and every read pays to reconstruct it</pre>
+
+<!-- ============ 8 ============ -->
+<div class="pg"></div>
+<h2><span class="sec">8</span> Serving — ClickHouse</h2>
+
+<h3>Topology</h3>
+<pre>                    ┌──────────────┐
+   API  ──────────▶ │ Load balancer│
+                    └──────┬───────┘
+              ┌────────────┼────────────┐
+              ▼            ▼            ▼
+        ┌──────────┐ ┌──────────┐ ┌──────────┐
+        │ Replica 1│ │ Replica 2│ │ Replica 3│
+        └──────────┘ └──────────┘ └──────────┘
+              └────────────┼────────────┘
+                    ClickHouse Keeper
+                  (replication metadata)
+
+NO SHARDING. 37 GB working set fits one node many times over.
+Replicas exist for CONCURRENCY and AVAILABILITY, not capacity.</pre>
+
+<div class="why"><b>Replicas, not shards — and this is the most commonly misunderstood decision.</b>
+Sharding solves "the data will not fit". Replicas solve "there are too many concurrent queries". At 37 GB
+with 200 concurrent users, the constraint is unambiguously concurrency. Sharding here would add operational
+cost, cross-shard query coordination, and a permanent, hard-to-reverse sharding key — for no benefit.</div>
+
+<h3>Node sizing</h3>
+<pre>Per replica:  16 vCPU · 64 GB RAM · 500 GB NVMe
+              working set (37 GB) fits in page cache with headroom
+3 replicas across availability zones</pre>
+
+<h3>Concurrency tuning — the setting that makes 200 users work</h3>
+<pre>SET max_threads = 4;                    -- one query must NOT eat all 16 cores
+SET max_execution_time = 10;
+SET max_memory_usage = 8000000000;
+SET max_concurrent_queries = 100;       -- per node</pre>
+<p>By default a single ClickHouse query grabs every core. For a dashboard workload you deliberately cap it,
+trading single-query latency for concurrent throughput.</p>
+
+<h3>Incremental load from Iceberg</h3>
+<pre>-- every 5 minutes
+INSERT INTO trips_serving
+SELECT * FROM lake.trips
+WHERE _iceberg_snapshot_id > (SELECT max(last_snapshot) FROM _load_watermark)
+  AND start_date >= today() - 90;</pre>
+<p><b>Depends on the refined layer being append-only or version-stamped.</b> Because Flink emits late
+corrections as new rows with a higher <code>_version</code>, <code>ReplacingMergeTree</code> collapses them
+on merge. Read with <code>FINAL</code>, or accept eventual dedup for rollups.</p>
+
+<!-- ============ 9 ============ -->
+<div class="pg"></div>
+<h2><span class="sec">9</span> The Option A / Option B decision</h2>
+
+<table>
+<tr><th style="width:50%">OPTION A — query Iceberg in place</th><th>OPTION B — materialise into MergeTree</th></tr>
+<tr><td><pre>CREATE DATABASE lake
+ENGINE = DataLakeCatalog
+SETTINGS catalog_type='glue',
+         region='us-east-1';
+
+SELECT ... FROM lake.trips
+WHERE company_id = 42;</pre></td>
+<td><pre>CREATE TABLE trips_serving (...)
+ENGINE = ReplacingMergeTree(_version)
+ORDER BY (company_id, start_date,
+          device_id, start_time);
+
+-- + 5-minute incremental load</pre></td></tr>
+<tr><td>✓ No duplicate storage, no sync job<br>
+        ✓ S3 remains the only copy<br>
+        ✓ Always current — no freshness lag<br>
+        ✗ <b>No ClickHouse sparse index</b><br>
+        ✗ Cold S3 reads on every query<br>
+        ✗ Concurrency multiplies S3 requests</td>
+    <td>✓ <b>Sparse index, codecs, projections, MVs</b><br>
+        ✓ Millisecond queries at high concurrency<br>
+        ✓ Predictable latency<br>
+        ✗ Duplicate storage (37 GB — trivial)<br>
+        ✗ A sync job to build and monitor<br>
+        ✗ Freshness lag that must be published</td></tr>
+</table>
+
+<h3>The evidence</h3>
+<div class="num"><b>Measured on a single laptop core, 43M rows:</b>
+<table style="margin-top:5pt">
+<tr><td style="width:52%">Full aggregation over 43M rows</td><td><b>0.033 s</b></td></tr>
+<tr><td>Filter on the <code>ORDER BY</code> prefix</td><td><b>0.002 s</b> — 330 of 5,284 granules read, 94% skipped</td></tr>
+<tr><td>Same query via materialized view</td><td><b>0.002 s</b> — 22×, from a 54 KB rollup instead of an 896 MB scan</td></tr>
+</table>
+None of that is available in Option A. Querying Iceberg in place gives you <b>only Iceberg partition
+pruning</b> — no sparse index, no codecs, no projections, no MVs.</div>
+
+<h3>Decision</h3>
+<div class="why"><b>Option B for serving. Option A retained for the cold tail.</b><br><br>
+The <code>p99 &lt; 500 ms at 200 concurrent</code> requirement rules out cold S3 reads per query. The
+duplicate storage objection evaporates once you notice the serving set is <b>37 GB, not 210 TB</b>.<br><br>
+<b>But keep Option A configured</b> for queries older than 90 days. Recent data in MergeTree, history
+queried in place through the Glue catalog. One system, two access paths, no separate archive.</div>
+
+<div class="warn"><b>Still POC Option A first — and benchmark at real concurrency, not single-query.</b>
+A single Iceberg query may look acceptable. Two hundred of them against S3 will not. The failure mode only
+appears under load, so a single-query benchmark will mislead you into the wrong architecture.</div>
+
+<!-- ============ 10 ============ -->
+<div class="pg"></div>
+<h2><span class="sec">10</span> API &amp; multi-tenancy</h2>
+
+<h3>Request path</h3>
+<pre>Customer browser
+   ▼  JWT (contains company_id)
+GraphQL / Cube API
+   ▼  inject company_id — NEVER from a client parameter
+Query cache (Redis, 60 s TTL)
+   ▼  miss
+ClickHouse load balancer → replica
+   ▼
+MergeTree or materialized view</pre>
+
+<div class="warn"><b>Tenant isolation is the highest-severity risk in the system.</b> A single missing
+<code>company_id</code> predicate leaks one customer's fleet data to another. Three layers of defence:
+<ol>
+<li><b>Derive <code>company_id</code> from the JWT server-side.</b> Never accept it as a query parameter.</li>
+<li><b>ClickHouse row policy</b> as a backstop:<br>
+<code>CREATE ROW POLICY tenant ON trips_serving USING company_id = getSetting('SQL_tenant') TO api_user;</code></li>
+<li><b>Automated test</b> that asserts every API query plan contains a <code>company_id</code> filter.</li>
+</ol></div>
+
+<h3>Caching strategy</h3>
+<table>
+<tr><td style="width:26%"><b>ClickHouse query cache</b></td><td>Identical queries, seconds. Free.</td></tr>
+<tr><td><b>Redis, 60 s TTL</b></td><td>Dashboard tiles. Key includes <code>company_id</code>. Absorbs the refresh stampede.</td></tr>
+<tr><td><b>Materialized views</b></td><td>Not a cache — pre-computation. The real win.</td></tr>
+</table>
+<p class="small"><b>Cache TTL must be shorter than the freshness SLA</b>, or you promise 10-minute data and
+serve 20-minute data.</p>
+
+<!-- ============ 11 ============ -->
+<div class="pg"></div>
+<h2><span class="sec">11</span> Failure modes &amp; recovery</h2>
+
+<table>
+<tr><th style="width:20%">Failure</th><th style="width:20%">Blast radius</th><th>Mitigation &amp; recovery</th></tr>
+<tr><td><b>Kafka broker loss</b></td><td>None</td><td>RF=3, min.insync=2. Automatic leader election.</td></tr>
+<tr><td><b>Flink job crash</b></td><td>Ingest stalls</td><td>Restart from the last checkpoint (≤30 s of reprocessing). Kafka's 7-day retention is the buffer.</td></tr>
+<tr><td><b>Flink state corruption</b></td><td>Hours</td><td>Restore from an older checkpoint or savepoint. Replay from Kafka. <b>This is why 7-day retention exists.</b></td></tr>
+<tr><td><b>S3 unavailable</b></td><td>Writes stall</td><td>Flink backpressures into Kafka, which buffers. Serving continues from ClickHouse.</td></tr>
+<tr><td><b>ClickHouse replica down</b></td><td>None</td><td>LB removes it. Remaining replicas absorb load. <b>Size for N−1.</b></td></tr>
+<tr><td><b>All ClickHouse down</b></td><td>Dashboards down</td><td>Rebuild from Iceberg. 90 days ≈ 30 GB ≈ <b>under an hour</b>. Lake is the source of truth.</td></tr>
+<tr><td><b>Bad deploy of Flink logic</b></td><td>Corrupt refined data</td><td>Iceberg snapshot rollback, then replay from Kafka with fixed logic.</td></tr>
+<tr><td><b>Idle Kafka partition</b></td><td><b>Silent output stop</b></td><td><code>withIdleness</code>. <b>Alert on watermark lag, not just job health</b> — the job reports healthy while producing nothing.</td></tr>
+<tr><td><b>Unbounded Flink state</b></td><td>OOM in days/weeks</td><td>State TTL, max-trip-duration timers, and <b>alert on state size trend</b>.</td></tr>
+</table>
+
+<h3>What to actually monitor</h3>
+<pre>INGEST     Kafka consumer lag · producer error rate
+FLINK      watermark lag  ◀── the leading indicator, monitor this first
+           checkpoint duration and failures
+           state size trend  ◀── monotonic growth predicts death weeks ahead
+           backpressure per operator
+LAKE       files per partition (small-file detection) · commit latency
+SERVING    ClickHouse p50/p95/p99 · concurrent queries · parts count
+           incremental load lag  ◀── the freshness SLA
+API        p99 by endpoint · cache hit rate · 5xx rate
+BUSINESS   trips/hour vs 7-day baseline  ◀── catches silent pipeline failure</pre>
+
+<div class="why"><b>The last one matters most.</b> Every technical metric can look healthy while the pipeline
+produces nothing — an idle-partition watermark stall does exactly this. <b>A business-level volume check
+against baseline is the only alert that catches silent failure.</b></div>
+
+<!-- ============ 12 ============ -->
+<div class="pg"></div>
+<h2><span class="sec">12</span> Cost model</h2>
+
+<pre>KAFKA  (MSK, 6 × m5.2xlarge + tiered storage)          ~$4,500/mo
+FLINK  (16 × 4 vCPU/16 GB, or managed)                 ~$3,500/mo
+S3     bronze 228 TB, tiered to IA/Glacier              ~$3,200/mo
+       silver 1 TB Standard                               ~$25/mo
+       requests + S3 Tables compaction                   ~$800/mo
+GLUE   catalog + crawlers                                 ~$50/mo
+CLICKHOUSE  3 × (16 vCPU, 64 GB, 500 GB NVMe)          ~$1,800/mo
+API    GraphQL/Cube containers + Redis                   ~$900/mo
+────────────────────────────────────────────────────────────────
+TOTAL                                                  ~$14,800/mo
+
+REMOVED: Redshift cluster (ra3.4xlarge × 4)            −$9,000/mo
+                                                       ═══════════
+NET CHANGE                                              ~+$5,800/mo
+   ...but replacing an 8-node Redshift with 3 ClickHouse nodes
+      that answer in 20 ms instead of 3 s.</pre>
+
+<h3>Where the money actually goes — and the levers</h3>
+<table>
+<tr><td style="width:30%"><b>Bronze S3 storage</b> (~22%)</td><td>The biggest single line. <b>Lever:</b> aggressive lifecycle to Glacier IR, and question whether 13 months of raw is genuinely required.</td></tr>
+<tr><td><b>Kafka</b> (~30%)</td><td><b>Lever:</b> tiered storage moves cold segments to S3 at a fraction of broker-disk cost.</td></tr>
+<tr><td><b>Flink</b> (~24%)</td><td>Sized by state and throughput. <b>Lever:</b> reactive mode / autoscaling on the overnight trough.</td></tr>
+<tr><td><b>ClickHouse</b> (~12%)</td><td>Cheap because the working set is 37 GB. <b>This is the design paying off.</b></td></tr>
+</table>
+
+<div class="num"><b>The efficiency headline for the architecture review:</b> serving costs ~12% of the
+platform because the pipeline reduces 210 TB/year to 130 GB/year before anything reaches the serving layer.
+Redshift Spectrum was scanning the lake per query; ClickHouse scans a 37 GB indexed working set.</div>
+
+<!-- ============ 13 ============ -->
+<div class="pg"></div>
+<h2><span class="sec">13</span> Migration plan</h2>
+
+<pre>PHASE 1 · Plumbing            2 weeks
+  Stand up ClickHouse (3 replicas + Keeper)
+  Configure DataLakeCatalog → Glue → verify it can read Iceberg
+  Build the incremental load job with snapshot watermarks
+  EXIT: ClickHouse returns correct row counts vs the lake
+
+PHASE 2 · Benchmark            1 week
+  POC Option A at REAL CONCURRENCY (50, 100, 200 clients)
+  Benchmark Option B on the same query set
+  EXIT: a documented latency/concurrency curve for both
+
+PHASE 3 · One dashboard        2 weeks
+  Pick the highest-traffic dashboard
+  Build MergeTree tables + materialized views for it only
+  EXIT: p99 < 500 ms at production concurrency
+
+PHASE 4 · Parity harness       2 weeks  ◀── the gate
+  Automated job: same query set against Redshift AND ClickHouse
+  Compare per-tenant row counts and aggregates, diff → alert
+  EXIT: green for 14 consecutive days
+
+PHASE 5 · Cut over             4 weeks
+  Migrate dashboards one at a time behind a feature flag
+  Redshift stays warm for instant rollback
+  EXIT: all traffic on ClickHouse
+
+PHASE 6 · Decommission         1 week
+  Migrate the remaining Redshift materialized views
+  Snapshot, then delete the cluster
+                                ───────
+                        TOTAL:  12 weeks</pre>
+
+<div class="why"><b>Phase 4 is the gate, and it is non-negotiable.</b> The parity harness is what converts
+"we think ClickHouse is right" into "we have 14 days of evidence that the numbers match." Without it, the
+first customer-reported discrepancy after cutover becomes an argument rather than a diagnosis.</div>
+
+<h3>Rollback at every phase</h3>
+<p>Redshift stays operational until phase 6. Every dashboard cutover is behind a feature flag, so rollback
+is a config change, not a redeploy. <b>Nothing in phases 1–5 is irreversible.</b></p>
+
+<!-- ============ 14 ============ -->
+<div class="pg"></div>
+<h2><span class="sec">14</span> Trade-offs &amp; alternatives considered</h2>
+
+<table>
+<tr><th style="width:22%">Alternative</th><th style="width:34%">Why not</th><th>When it would be right</th></tr>
+<tr><td><b>Keep Redshift</b></td><td>Spectrum pays S3 latency per query; concurrency scaling is limited and expensive. Cluster runs 24/7 regardless of load.</td><td>If the workload were internal BI with tens of users, not thousands of tenants</td></tr>
+<tr><td><b>Druid / Pinot</b></td><td>Genuinely strong at this workload. But another operational surface, and ClickHouse's SQL is closer to what the team already writes.</td><td>If sub-100 ms at 10K+ QPS were required</td></tr>
+<tr><td><b>Spark Structured Streaming instead of Flink</b></td><td>Micro-batch latency floor; global watermarks; checkpoints tied to plan version, so code changes are painful. <b>State ceiling is the blocker</b> — trip sessions hold GB of long-lived state.</td><td>If latency were minutes and state were small and windowed</td></tr>
+<tr><td><b>Kafka → ClickHouse directly</b></td><td><b>Two transformation pipelines.</b> Someone changes Flink logic and forgets ClickHouse. Iceberg says 1,923 safety events, ClickHouse says 1,947.</td><td>Only for a genuinely different SLA — e.g. a &lt;2 s live view alongside the batch path, in a separately named table</td></tr>
+<tr><td><b>Shard ClickHouse</b></td><td>37 GB working set. Sharding adds coordination, an irreversible sharding key, and weak cross-shard joins for zero benefit.</td><td>When the hot working set exceeds one node's RAM+NVMe — tier to S3 first, that usually defers it indefinitely</td></tr>
+<tr><td><b>Delta Lake instead of Iceberg</b></td><td>S3 Tables is natively Iceberg. Iceberg has broader engine support — Athena, Trino, Flink, ClickHouse.</td><td>If the shop were Databricks-centric</td></tr>
+</table>
+
+<h3>Known limitations of this design</h3>
+<ul>
+<li><b>90-day serving window.</b> Queries beyond it fall back to Option A and are slower. Acceptable because
+dashboard usage is overwhelmingly recent, but it must be communicated, not discovered.</li>
+<li><b>~10 minute freshness.</b> Not real-time. If a customer needs sub-minute, that requires a separate
+Kafka → ClickHouse path with explicitly different semantics.</li>
+<li><b>Single-region.</b> Multi-region adds cross-region replication cost and consistency questions not
+addressed here.</li>
+<li><b>Late corrections beyond 90 days</b> update Iceberg but not the ClickHouse serving table. Needs either
+a periodic reconciliation job or an accepted staleness boundary.</li>
+</ul>
+
+<h3>The three sentences for the architecture review</h3>
+<div class="why">
+<b>1.</b> S3 Tables remains our durable, open-format system of record; Flink owns the canonical
+transformation logic and produces refined Iceberg tables.<br><br>
+<b>2.</b> We validate ClickHouse's native Glue/Iceberg access first — but we expect it to miss
+customer-facing concurrency SLOs, and the POC sets the boundary of where in-place querying remains useful.<br><br>
+<b>3.</b> ClickHouse becomes the serving layer by incrementally materialising the refined dataset into
+native MergeTree; Redshift is a migration bridge and is retired after 14 days of automated parity.
+</div>
+
+<p class="small" style="margin-top:14pt; border-top:1px solid #ccc; padding-top:6pt">
+Capacity figures are estimates from the stated assumptions — 200K devices, 1 event/sec, 10 active hours.
+ClickHouse timings measured on a single laptop core against 43M rows. Costs are US-East list-price
+approximations and will vary with commitment discounts.
+</p>

@@ -1,0 +1,337 @@
+<meta charset="utf-8">
+<title>S3 → Redshift, Databricks & ClickHouse</title>
+<style>
+  @page { size: A4 landscape; margin: 8mm; }
+  body { font-family: -apple-system, "Helvetica Neue", Arial, sans-serif; margin: 0; color: #16181d; }
+  h1 { font-size: 15pt; margin: 0 0 2pt; text-align: center; }
+  .sub { text-align: center; font-size: 8.5pt; color: #666; margin-bottom: 3pt; }
+  svg { display: block; margin: 0 auto; }
+  .page { page-break-before: always; }
+</style>
+
+<h1>S3 Parquet → Redshift · Databricks · ClickHouse</h1>
+<p class="sub">Three consumers, one bucket · account 457360056131 · us-east-1</p>
+
+<svg viewBox="0 0 1120 610" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial">
+  <defs>
+    <marker id="g" markerWidth="10" markerHeight="10" refX="9" refY="3.5" orient="auto">
+      <path d="M0,0 L0,7 L10,3.5 z" fill="#2e7d32"/></marker>
+    <marker id="o" markerWidth="10" markerHeight="10" refX="9" refY="3.5" orient="auto">
+      <path d="M0,0 L0,7 L10,3.5 z" fill="#c2410c"/></marker>
+    <marker id="r" markerWidth="10" markerHeight="10" refX="9" refY="3.5" orient="auto">
+      <path d="M0,0 L0,7 L10,3.5 z" fill="#d81b60"/></marker>
+    <marker id="k" markerWidth="10" markerHeight="10" refX="9" refY="3.5" orient="auto">
+      <path d="M0,0 L0,7 L10,3.5 z" fill="#455a64"/></marker>
+    <marker id="p" markerWidth="10" markerHeight="10" refX="9" refY="3.5" orient="auto">
+      <path d="M0,0 L0,7 L10,3.5 z" fill="#7e3ff2"/></marker>
+  </defs>
+
+  <!-- SOURCES -->
+  <rect x="14" y="248" width="96" height="86" rx="7" fill="#eceff1" stroke="#607d8b" stroke-width="2"/>
+  <text x="62" y="272" text-anchor="middle" font-size="10.5" font-weight="bold" fill="#37474f">SOURCES</text>
+  <text x="62" y="291" text-anchor="middle" font-size="8.3" fill="#455a64">Kafka · Flink</text>
+  <text x="62" y="306" text-anchor="middle" font-size="8.3" fill="#455a64">RDS · APIs</text>
+  <text x="62" y="321" text-anchor="middle" font-size="8.3" fill="#455a64">files</text>
+  <line x1="110" y1="290" x2="146" y2="290" stroke="#455a64" stroke-width="2.2" marker-end="url(#k)"/>
+
+  <!-- S3 -->
+  <rect x="150" y="176" width="176" height="232" rx="10" fill="#fff8ee" stroke="#FF9900" stroke-width="3"/>
+  <rect x="150" y="176" width="176" height="32" rx="10" fill="#FF9900"/>
+  <rect x="150" y="198" width="176" height="12" fill="#FF9900"/>
+  <text x="238" y="198" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#fff">Amazon S3</text>
+
+  <rect x="162" y="220" width="152" height="54" rx="4" fill="#fff" stroke="#c9a24a" stroke-width="1.3"/>
+  <text x="170" y="236" font-size="9" font-weight="bold" fill="#7a5c10">raw/</text>
+  <text x="170" y="251" font-size="7.9" font-family="monospace" fill="#555">*.parquet</text>
+  <text x="170" y="265" font-size="7.4" fill="#999">plain files</text>
+
+  <rect x="162" y="280" width="152" height="60" rx="4" fill="#fff" stroke="#4a7fc9" stroke-width="1.3"/>
+  <text x="170" y="296" font-size="9" font-weight="bold" fill="#14508f">delta/  ·  iceberg/</text>
+  <text x="170" y="311" font-size="7.9" font-family="monospace" fill="#555">part-*.parquet</text>
+  <text x="170" y="324" font-size="7.9" font-family="monospace" fill="#c2410c">_delta_log/ · metadata/</text>
+  <text x="170" y="336" font-size="7.4" fill="#999">table format layer</text>
+
+  <rect x="162" y="346" width="152" height="50" rx="4" fill="#fff" stroke="#2e7d32" stroke-width="1.3"/>
+  <text x="170" y="362" font-size="9" font-weight="bold" fill="#1b5e20">curated/</text>
+  <text x="170" y="377" font-size="7.9" font-family="monospace" fill="#555">daily_metrics/*.parquet</text>
+  <text x="170" y="389" font-size="7.4" fill="#999">small · BI-ready</text>
+
+  <!-- GLUE CATALOG (shared metadata) -->
+  <rect x="384" y="24" width="164" height="62" rx="7" fill="#f3e8fd" stroke="#7e3ff2" stroke-width="2"/>
+  <text x="466" y="45" text-anchor="middle" font-size="10.5" font-weight="bold" fill="#4c1d95">AWS Glue</text>
+  <text x="466" y="60" text-anchor="middle" font-size="10.5" font-weight="bold" fill="#4c1d95">Data Catalog</text>
+  <text x="466" y="77" text-anchor="middle" font-size="7.8" fill="#666">schemas · partitions · Iceberg refs</text>
+
+  <rect x="384" y="98" width="164" height="34" rx="6" fill="#e8f0fe" stroke="#4285f4" stroke-width="1.6"/>
+  <text x="466" y="119" text-anchor="middle" font-size="9.4" font-weight="bold" fill="#1a4d8f">Glue Crawler</text>
+  <path d="M 250 176 L 250 115 L 380 115" fill="none" stroke="#4285f4" stroke-width="1.9" marker-end="url(#k)"/>
+  <line x1="466" y1="98" x2="466" y2="90" stroke="#7e3ff2" stroke-width="1.8" marker-end="url(#p)"/>
+
+  <!-- ============ LANE 1 : REDSHIFT ============ -->
+  <rect x="340" y="150" width="768" height="122" rx="8" fill="#f7faff" stroke="#c3d4ea"/>
+  <text x="352" y="167" font-size="9" font-weight="bold" fill="#2f5fa8">LANE 1 — Redshift  (copy data IN)</text>
+
+  <rect x="392" y="176" width="130" height="38" rx="5" fill="#e8f5e9" stroke="#2e7d32" stroke-width="2"/>
+  <text x="457" y="192" text-anchor="middle" font-size="9.6" font-weight="bold" fill="#1b5e20">COPY</text>
+  <text x="457" y="206" text-anchor="middle" font-size="7.6" fill="#2e7d32">parallel bulk load</text>
+
+  <rect x="392" y="222" width="130" height="38" rx="5" fill="#e8f5e9" stroke="#2e7d32" stroke-width="1.5"/>
+  <text x="457" y="238" text-anchor="middle" font-size="9.6" font-weight="bold" fill="#1b5e20">Glue ETL Job</text>
+  <text x="457" y="252" text-anchor="middle" font-size="7.6" fill="#2e7d32">transform on the way</text>
+
+  <rect x="556" y="176" width="130" height="38" rx="5" fill="#fffde7" stroke="#f9a825" stroke-width="1.7"/>
+  <text x="621" y="192" text-anchor="middle" font-size="9.6" font-weight="bold" fill="#8a6d00">Spectrum</text>
+  <text x="621" y="206" text-anchor="middle" font-size="7.6" fill="#8a6d00">no copy, query in place</text>
+
+  <rect x="556" y="222" width="130" height="38" rx="5" fill="#eceff1" stroke="#607d8b" stroke-width="1.4"/>
+  <text x="621" y="238" text-anchor="middle" font-size="9.6" font-weight="bold" fill="#37474f">Zero-ETL</text>
+  <text x="621" y="252" text-anchor="middle" font-size="7.6" fill="#546e7a">from Aurora / RDS</text>
+
+  <line x1="328" y1="240" x2="388" y2="200" stroke="#2e7d32" stroke-width="2.2" marker-end="url(#g)"/>
+  <line x1="690" y1="218" x2="748" y2="210" stroke="#2e7d32" stroke-width="2.2" marker-end="url(#g)"/>
+
+  <rect x="752" y="164" width="200" height="94" rx="8" fill="#eaf1fb" stroke="#2f5fa8" stroke-width="2.6"/>
+  <rect x="752" y="164" width="200" height="28" rx="8" fill="#2f5fa8"/>
+  <rect x="752" y="182" width="200" height="10" fill="#2f5fa8"/>
+  <text x="852" y="184" text-anchor="middle" font-size="11" font-weight="bold" fill="#fff">Amazon Redshift</text>
+  <text x="852" y="210" text-anchor="middle" font-size="8.3" fill="#333">data stored IN the cluster</text>
+  <text x="852" y="226" text-anchor="middle" font-size="8.3" fill="#333">DISTKEY · SORTKEY</text>
+  <text x="852" y="246" text-anchor="middle" font-size="7.8" fill="#777">BI dashboards · SQL analysts</text>
+
+  <rect x="968" y="176" width="136" height="70" rx="7" fill="#f8f9fa" stroke="#999" stroke-width="1.6"/>
+  <text x="1036" y="198" text-anchor="middle" font-size="9.4" font-weight="bold" fill="#333">BI tools</text>
+  <text x="1036" y="215" text-anchor="middle" font-size="7.8" fill="#666">QuickSight · Tableau</text>
+  <text x="1036" y="230" text-anchor="middle" font-size="7.8" fill="#666">Power BI</text>
+  <line x1="956" y1="211" x2="964" y2="211" stroke="#455a64" stroke-width="2" marker-end="url(#k)"/>
+
+  <!-- ============ LANE 2 : DATABRICKS ============ -->
+  <rect x="340" y="284" width="768" height="106" rx="8" fill="#fffaf7" stroke="#e8c4ae"/>
+  <text x="352" y="301" font-size="9" font-weight="bold" fill="#c2410c">LANE 2 — Databricks  (leave data IN S3)</text>
+
+  <rect x="430" y="310" width="200" height="60" rx="6" fill="#fff1e8" stroke="#c2410c" stroke-width="2"/>
+  <text x="530" y="330" text-anchor="middle" font-size="9.8" font-weight="bold" fill="#9a3412">S3 direct (IAM role)</text>
+  <text x="530" y="346" text-anchor="middle" font-size="7.8" fill="#9a3412">Unity Catalog external location</text>
+  <text x="530" y="360" text-anchor="middle" font-size="7.8" fill="#9a3412">read raw · write Delta back</text>
+
+  <line x1="328" y1="320" x2="426" y2="332" stroke="#c2410c" stroke-width="2.4" marker-end="url(#o)"/>
+  <line x1="426" y1="352" x2="328" y2="340" stroke="#c2410c" stroke-width="2.4" marker-end="url(#o)"/>
+  <line x1="634" y1="340" x2="748" y2="336" stroke="#c2410c" stroke-width="2.4" marker-end="url(#o)"/>
+
+  <rect x="752" y="300" width="200" height="80" rx="8" fill="#fdeee6" stroke="#c2410c" stroke-width="2.6"/>
+  <rect x="752" y="300" width="200" height="28" rx="8" fill="#c2410c"/>
+  <rect x="752" y="318" width="200" height="10" fill="#c2410c"/>
+  <text x="852" y="320" text-anchor="middle" font-size="11" font-weight="bold" fill="#fff">Databricks</text>
+  <text x="852" y="345" text-anchor="middle" font-size="8.3" fill="#333">compute only — NO data stored</text>
+  <text x="852" y="362" text-anchor="middle" font-size="7.8" fill="#777">ETL · ML · big transforms</text>
+
+  <rect x="968" y="308" width="136" height="64" rx="7" fill="#f3e8fd" stroke="#7e3ff2" stroke-width="1.6"/>
+  <text x="1036" y="329" text-anchor="middle" font-size="9.4" font-weight="bold" fill="#4c1d95">Athena</text>
+  <text x="1036" y="346" text-anchor="middle" font-size="7.8" fill="#666">ad-hoc SQL on S3</text>
+  <text x="1036" y="360" text-anchor="middle" font-size="7.8" fill="#666">via Glue Catalog</text>
+
+  <!-- ============ LANE 3 : CLICKHOUSE ============ -->
+  <rect x="340" y="402" width="768" height="140" rx="8" fill="#fffdf2" stroke="#e6d48a"/>
+  <text x="352" y="419" font-size="9" font-weight="bold" fill="#8a6d00">LANE 3 — ClickHouse  (two options: query in place, or materialise)</text>
+
+  <rect x="384" y="428" width="150" height="46" rx="5" fill="#fffde7" stroke="#f9a825" stroke-width="2"/>
+  <text x="459" y="446" text-anchor="middle" font-size="9.4" font-weight="bold" fill="#8a6d00">A · s3() function</text>
+  <text x="459" y="460" text-anchor="middle" font-size="7.6" fill="#8a6d00">read Parquet directly</text>
+  <text x="459" y="470" text-anchor="middle" font-size="7.2" fill="#a08010">no copy</text>
+
+  <rect x="384" y="482" width="150" height="48" rx="5" fill="#fffde7" stroke="#f9a825" stroke-width="2"/>
+  <text x="459" y="500" text-anchor="middle" font-size="9.4" font-weight="bold" fill="#8a6d00">A · DataLakeCatalog</text>
+  <text x="459" y="514" text-anchor="middle" font-size="7.6" fill="#8a6d00">Iceberg / Delta via Glue</text>
+  <text x="459" y="525" text-anchor="middle" font-size="7.2" fill="#a08010">no copy</text>
+
+  <rect x="566" y="450" width="160" height="56" rx="5" fill="#ffe9c7" stroke="#d4a017" stroke-width="2.4"/>
+  <text x="646" y="470" text-anchor="middle" font-size="9.8" font-weight="bold" fill="#7a5c10">B · INSERT INTO</text>
+  <text x="646" y="485" text-anchor="middle" font-size="8.4" font-weight="bold" fill="#7a5c10">native MergeTree</text>
+  <text x="646" y="499" text-anchor="middle" font-size="7.4" fill="#8a6d00">sparse index · codecs · projections</text>
+
+  <line x1="328" y1="370" x2="380" y2="448" stroke="#f9a825" stroke-width="2.2" marker-end="url(#k)"/>
+  <path d="M 466 132 L 466 424" fill="none" stroke="#7e3ff2" stroke-width="1.7"
+        stroke-dasharray="5,3" marker-end="url(#p)"/>
+  <text x="474" y="415" font-size="7.4" fill="#7e3ff2">catalog</text>
+  <line x1="538" y1="470" x2="562" y2="474" stroke="#d4a017" stroke-width="2.2" marker-end="url(#k)"/>
+  <line x1="538" y1="504" x2="562" y2="492" stroke="#d4a017" stroke-width="2.2" marker-end="url(#k)"/>
+  <line x1="730" y1="478" x2="748" y2="470" stroke="#d4a017" stroke-width="2.6" marker-end="url(#k)"/>
+
+  <rect x="752" y="418" width="200" height="106" rx="8" fill="#fff8e1" stroke="#F5C000" stroke-width="2.8"/>
+  <rect x="752" y="418" width="200" height="28" rx="8" fill="#F5C000"/>
+  <rect x="752" y="436" width="200" height="10" fill="#F5C000"/>
+  <text x="852" y="438" text-anchor="middle" font-size="11" font-weight="bold" fill="#3a2c00">ClickHouse</text>
+  <text x="852" y="462" text-anchor="middle" font-size="8.3" fill="#333">MergeTree · vectorised</text>
+  <text x="852" y="478" text-anchor="middle" font-size="8.3" font-family="monospace" fill="#555">ORDER BY (tenant, ts)</text>
+  <text x="852" y="495" text-anchor="middle" font-size="8" fill="#666">materialized views · projections</text>
+  <text x="852" y="513" text-anchor="middle" font-size="7.8" fill="#8a6d00" font-weight="bold">ms-latency · high concurrency</text>
+
+  <rect x="968" y="428" width="136" height="86" rx="7" fill="#f8f9fa" stroke="#999" stroke-width="1.6"/>
+  <text x="1036" y="450" text-anchor="middle" font-size="9.4" font-weight="bold" fill="#333">Customer</text>
+  <text x="1036" y="465" text-anchor="middle" font-size="9.4" font-weight="bold" fill="#333">dashboards</text>
+  <text x="1036" y="483" text-anchor="middle" font-size="7.8" fill="#666">GraphQL · Cube</text>
+  <text x="1036" y="498" text-anchor="middle" font-size="7.8" fill="#666">1000s concurrent</text>
+  <line x1="956" y1="470" x2="964" y2="470" stroke="#455a64" stroke-width="2" marker-end="url(#k)"/>
+
+  <!-- LEGEND -->
+  <rect x="14" y="418" width="316" height="176" rx="8" fill="#f8f9fa" stroke="#bbb"/>
+  <text x="28" y="438" font-size="10.4" font-weight="bold" fill="#222">How each engine treats the data</text>
+
+  <rect x="28" y="448" width="11" height="11" rx="2" fill="#eaf1fb" stroke="#2f5fa8" stroke-width="1.6"/>
+  <text x="46" y="457" font-size="8.6" fill="#222"><tspan font-weight="bold">Redshift</tspan> — COPIES in. 2nd copy exists.</text>
+  <text x="46" y="470" font-size="8" fill="#666">Cluster always running. Closed format.</text>
+
+  <rect x="28" y="482" width="11" height="11" rx="2" fill="#fdeee6" stroke="#c2410c" stroke-width="1.6"/>
+  <text x="46" y="491" font-size="8.6" fill="#222"><tspan font-weight="bold">Databricks</tspan> — LEAVES data in S3.</text>
+  <text x="46" y="504" font-size="8" fill="#666">Table IS the folder. Compute disposable.</text>
+
+  <rect x="28" y="516" width="11" height="11" rx="2" fill="#fff8e1" stroke="#F5C000" stroke-width="1.8"/>
+  <text x="46" y="525" font-size="8.6" fill="#222"><tspan font-weight="bold">ClickHouse</tspan> — EITHER, and that's the choice.</text>
+  <text x="46" y="538" font-size="8" fill="#8a6d00">A: query S3 in place — no index, cold reads.</text>
+  <text x="46" y="551" font-size="8" fill="#8a6d00">B: materialise to MergeTree — ms latency.</text>
+
+  <line x1="28" y1="560" x2="316" y2="560" stroke="#ccc"/>
+  <text x="28" y="576" font-size="8.4" fill="#444">▸ Glue Data Catalog is shared by all three.</text>
+  <text x="28" y="589" font-size="8.4" fill="#444">▸ S3 stays the single source of truth.</text>
+</svg>
+
+<!-- ================= PAGE 2 ================= -->
+<div class="page"></div>
+<h1>ClickHouse: Option A vs Option B</h1>
+<p class="sub">The decision that determines your serving architecture — measured, not argued</p>
+
+<svg viewBox="0 0 1120 600" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial">
+  <defs>
+    <marker id="y" markerWidth="10" markerHeight="10" refX="9" refY="3.5" orient="auto">
+      <path d="M0,0 L0,7 L10,3.5 z" fill="#8a6d00"/></marker>
+    <marker id="d" markerWidth="10" markerHeight="10" refX="9" refY="3.5" orient="auto">
+      <path d="M0,0 L0,7 L10,3.5 z" fill="#455a64"/></marker>
+  </defs>
+
+  <!-- OPTION A -->
+  <rect x="20" y="40" width="520" height="248" rx="10" fill="#fffdf5" stroke="#d4a017" stroke-width="2.4"/>
+  <text x="40" y="66" font-size="13" font-weight="bold" fill="#7a5c10">OPTION A — query the lake in place</text>
+  <text x="40" y="84" font-size="8.8" fill="#8a6d00">No copy. S3 remains the only storage. Start here as a POC.</text>
+
+  <rect x="42" y="98" width="120" height="66" rx="6" fill="#fff8ee" stroke="#FF9900" stroke-width="2"/>
+  <text x="102" y="122" text-anchor="middle" font-size="10" font-weight="bold" fill="#8a5200">S3</text>
+  <text x="102" y="139" text-anchor="middle" font-size="7.8" fill="#666">Iceberg / Delta</text>
+  <text x="102" y="153" text-anchor="middle" font-size="7.8" fill="#666">refined tables</text>
+
+  <line x1="162" y1="131" x2="204" y2="131" stroke="#8a6d00" stroke-width="2.2" marker-end="url(#y)"/>
+
+  <rect x="208" y="98" width="120" height="66" rx="6" fill="#f3e8fd" stroke="#7e3ff2" stroke-width="1.8"/>
+  <text x="268" y="122" text-anchor="middle" font-size="9.6" font-weight="bold" fill="#4c1d95">Glue Catalog</text>
+  <text x="268" y="139" text-anchor="middle" font-size="7.8" fill="#666">table metadata</text>
+  <text x="268" y="153" text-anchor="middle" font-size="7.8" fill="#666">snapshot refs</text>
+
+  <line x1="328" y1="131" x2="370" y2="131" stroke="#8a6d00" stroke-width="2.2" marker-end="url(#y)"/>
+
+  <rect x="374" y="98" width="142" height="66" rx="6" fill="#fff8e1" stroke="#F5C000" stroke-width="2.4"/>
+  <text x="445" y="120" text-anchor="middle" font-size="10" font-weight="bold" fill="#3a2c00">ClickHouse</text>
+  <text x="445" y="137" text-anchor="middle" font-size="7.7" font-family="monospace" fill="#555">DataLakeCatalog</text>
+  <text x="445" y="152" text-anchor="middle" font-size="7.7" fill="#8a6d00">reads S3 per query</text>
+
+  <rect x="42" y="180" width="474" height="94" rx="6" fill="#fff" stroke="#ddd"/>
+  <text x="56" y="200" font-size="9.4" font-weight="bold" fill="#1b5e20">✓ No duplicate storage · no sync job · S3 is the only truth</text>
+  <text x="56" y="217" font-size="9.4" font-weight="bold" fill="#1b5e20">✓ Always current — no freshness lag</text>
+  <text x="56" y="238" font-size="9.4" font-weight="bold" fill="#c62828">✗ No ClickHouse sparse index — only Iceberg partition pruning</text>
+  <text x="56" y="255" font-size="9.4" font-weight="bold" fill="#c62828">✗ Cold S3 reads per query · concurrency multiplies S3 requests</text>
+  <text x="56" y="270" font-size="8.6" fill="#777">Fine for ad-hoc. Expect it to miss customer-facing SLOs.</text>
+
+  <!-- OPTION B -->
+  <rect x="580" y="40" width="520" height="248" rx="10" fill="#f7fff5" stroke="#2e7d32" stroke-width="2.4"/>
+  <text x="600" y="66" font-size="13" font-weight="bold" fill="#1b5e20">OPTION B — materialise into MergeTree</text>
+  <text x="600" y="84" font-size="8.8" fill="#2e7d32">Duplicate storage, but you get the index. The serving answer.</text>
+
+  <rect x="602" y="98" width="112" height="66" rx="6" fill="#fff8ee" stroke="#FF9900" stroke-width="2"/>
+  <text x="658" y="122" text-anchor="middle" font-size="10" font-weight="bold" fill="#8a5200">S3</text>
+  <text x="658" y="139" text-anchor="middle" font-size="7.8" fill="#666">system of record</text>
+  <text x="658" y="153" text-anchor="middle" font-size="7.8" fill="#666">full history</text>
+
+  <line x1="714" y1="131" x2="754" y2="131" stroke="#2e7d32" stroke-width="2.4" marker-end="url(#d)"/>
+  <rect x="756" y="108" width="124" height="46" rx="5" fill="#e8f5e9" stroke="#2e7d32" stroke-width="1.8"/>
+  <text x="818" y="126" text-anchor="middle" font-size="9" font-weight="bold" fill="#1b5e20">incremental load</text>
+  <text x="818" y="141" text-anchor="middle" font-size="7.6" fill="#2e7d32">snapshot watermark</text>
+  <line x1="880" y1="131" x2="918" y2="131" stroke="#2e7d32" stroke-width="2.4" marker-end="url(#d)"/>
+
+  <rect x="922" y="98" width="158" height="66" rx="6" fill="#fff8e1" stroke="#F5C000" stroke-width="2.4"/>
+  <text x="1001" y="118" text-anchor="middle" font-size="10" font-weight="bold" fill="#3a2c00">ClickHouse</text>
+  <text x="1001" y="134" text-anchor="middle" font-size="7.7" font-family="monospace" fill="#555">MergeTree</text>
+  <text x="1001" y="149" text-anchor="middle" font-size="7.7" font-family="monospace" fill="#555">ORDER BY (company_id, ts)</text>
+
+  <rect x="602" y="180" width="478" height="94" rx="6" fill="#fff" stroke="#ddd"/>
+  <text x="616" y="200" font-size="9.4" font-weight="bold" fill="#1b5e20">✓ Sparse index · codecs · projections · materialized views</text>
+  <text x="616" y="217" font-size="9.4" font-weight="bold" fill="#1b5e20">✓ Millisecond dashboard queries at high concurrency</text>
+  <text x="616" y="238" font-size="9.4" font-weight="bold" fill="#c62828">✗ Duplicate storage · sync job to build and monitor</text>
+  <text x="616" y="255" font-size="9.4" font-weight="bold" fill="#c62828">✗ Freshness lag — must be defined and published</text>
+  <text x="616" y="270" font-size="8.6" fill="#777">Hybrid: hot 90 days in MergeTree, older tiered to S3.</text>
+
+  <!-- MEASURED -->
+  <rect x="20" y="306" width="1080" height="132" rx="8" fill="#f8f9fa" stroke="#999"/>
+  <text x="40" y="328" font-size="11.5" font-weight="bold" fill="#222">Measured on one laptop core — 43,276,150 rows (OpenCelliD)</text>
+
+  <text x="46" y="352" font-size="8.6" font-weight="bold" fill="#555">OPERATION</text>
+  <text x="330" y="352" font-size="8.6" font-weight="bold" fill="#555">TIME</text>
+  <text x="470" y="352" font-size="8.6" font-weight="bold" fill="#555">WHAT IT PROVES</text>
+  <line x1="40" y1="358" x2="1080" y2="358" stroke="#ccc"/>
+
+  <text x="46" y="375" font-size="9" fill="#333">Load 43M rows from Parquet URL</text>
+  <text x="330" y="375" font-size="9" font-family="monospace" font-weight="bold" fill="#1b5e20">33 s</text>
+  <text x="470" y="375" font-size="8.6" fill="#666">1.3M rows/sec ingest, streamed and decompressed</text>
+
+  <text x="46" y="392" font-size="9" fill="#333">GROUP BY over all 43M rows</text>
+  <text x="330" y="392" font-size="9" font-family="monospace" font-weight="bold" fill="#1b5e20">0.033 s</text>
+  <text x="470" y="392" font-size="8.6" fill="#666">vectorised execution, 10 threads, no tuning</text>
+
+  <text x="46" y="409" font-size="9" fill="#333">Filter on ORDER BY prefix</text>
+  <text x="330" y="409" font-size="9" font-family="monospace" font-weight="bold" fill="#1b5e20">0.002 s</text>
+  <text x="470" y="409" font-size="8.6" fill="#666">330 of 5284 granules read — 94% skipped by the index</text>
+
+  <text x="46" y="426" font-size="9" fill="#333">Same query via materialized view</text>
+  <text x="330" y="426" font-size="9" font-family="monospace" font-weight="bold" fill="#1b5e20">0.002 s</text>
+  <text x="470" y="426" font-size="8.6" fill="#666">22× faster · 54 KB rollup instead of 896 MB scan</text>
+
+  <!-- MIGRATION -->
+  <rect x="20" y="452" width="1080" height="136" rx="8" fill="#fff" stroke="#2f5fa8" stroke-width="1.8"/>
+  <text x="40" y="474" font-size="11.5" font-weight="bold" fill="#1b3a70">Migration path — retiring Redshift</text>
+
+  <rect x="44" y="486" width="150" height="52" rx="6" fill="#eaf1fb" stroke="#2f5fa8" stroke-width="1.6"/>
+  <text x="119" y="506" text-anchor="middle" font-size="9" font-weight="bold" fill="#1b3a70">1 · Dual-run</text>
+  <text x="119" y="521" text-anchor="middle" font-size="7.6" fill="#555">Redshift + ClickHouse</text>
+  <text x="119" y="533" text-anchor="middle" font-size="7.6" fill="#555">same refined tables</text>
+  <line x1="196" y1="512" x2="222" y2="512" stroke="#455a64" stroke-width="2" marker-end="url(#d)"/>
+
+  <rect x="226" y="486" width="150" height="52" rx="6" fill="#fff8e1" stroke="#F5C000" stroke-width="1.8"/>
+  <text x="301" y="506" text-anchor="middle" font-size="9" font-weight="bold" fill="#3a2c00">2 · POC Option A</text>
+  <text x="301" y="521" text-anchor="middle" font-size="7.6" fill="#555">benchmark at REAL</text>
+  <text x="301" y="533" text-anchor="middle" font-size="7.6" fill="#555">concurrency, not 1 query</text>
+  <line x1="378" y1="512" x2="404" y2="512" stroke="#455a64" stroke-width="2" marker-end="url(#d)"/>
+
+  <rect x="408" y="486" width="150" height="52" rx="6" fill="#e8f5e9" stroke="#2e7d32" stroke-width="1.8"/>
+  <text x="483" y="506" text-anchor="middle" font-size="9" font-weight="bold" fill="#1b5e20">3 · Build Option B</text>
+  <text x="483" y="521" text-anchor="middle" font-size="7.6" fill="#555">MergeTree + MVs for</text>
+  <text x="483" y="533" text-anchor="middle" font-size="7.6" fill="#555">ONE dashboard first</text>
+  <line x1="560" y1="512" x2="586" y2="512" stroke="#455a64" stroke-width="2" marker-end="url(#d)"/>
+
+  <rect x="590" y="486" width="150" height="52" rx="6" fill="#f3e8fd" stroke="#7e3ff2" stroke-width="1.8"/>
+  <text x="665" y="506" text-anchor="middle" font-size="9" font-weight="bold" fill="#4c1d95">4 · Parity harness</text>
+  <text x="665" y="521" text-anchor="middle" font-size="7.6" fill="#555">automated row + agg diff</text>
+  <text x="665" y="533" text-anchor="middle" font-size="7.6" fill="#555">green for 2 weeks</text>
+  <line x1="742" y1="512" x2="768" y2="512" stroke="#455a64" stroke-width="2" marker-end="url(#d)"/>
+
+  <rect x="772" y="486" width="150" height="52" rx="6" fill="#f8f9fa" stroke="#666" stroke-width="1.6"/>
+  <text x="847" y="506" text-anchor="middle" font-size="9" font-weight="bold" fill="#333">5 · Cut over</text>
+  <text x="847" y="521" text-anchor="middle" font-size="7.6" fill="#555">GraphQL / Cube</text>
+  <text x="847" y="533" text-anchor="middle" font-size="7.6" fill="#555">per dashboard</text>
+  <line x1="924" y1="512" x2="950" y2="512" stroke="#455a64" stroke-width="2" marker-end="url(#d)"/>
+
+  <rect x="954" y="486" width="126" height="52" rx="6" fill="#ffebee" stroke="#c62828" stroke-width="1.8"/>
+  <text x="1017" y="509" text-anchor="middle" font-size="9.4" font-weight="bold" fill="#b71c1c">6 · Redshift OFF</text>
+  <text x="1017" y="526" text-anchor="middle" font-size="7.6" fill="#777">MVs migrated last</text>
+
+  <text x="40" y="562" font-size="8.8" fill="#444">
+    ▸ <tspan font-weight="bold">One owner of transformation logic.</tspan>
+    Flink writes refined Iceberg; ClickHouse reshapes for serving but never re-derives business metrics —</text>
+  <text x="40" y="577" font-size="8.8" fill="#444">
+    otherwise the two definitions diverge and a customer finds it before your tests do.</text>
+</svg>

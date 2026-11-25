@@ -1,0 +1,267 @@
+<meta charset="utf-8">
+<title>S3 → Redshift & Databricks — Architecture</title>
+<style>
+  @page { size: A4 landscape; margin: 8mm; }
+  body { font-family: -apple-system, "Helvetica Neue", Arial, sans-serif; margin: 0; color: #16181d; }
+  h1 { font-size: 15pt; margin: 0 0 2pt; text-align: center; }
+  .sub { text-align: center; font-size: 8.5pt; color: #666; margin-bottom: 4pt; }
+  svg { display: block; margin: 0 auto; }
+  .page { page-break-before: always; }
+</style>
+
+<h1>S3 Parquet → Redshift &amp; Databricks</h1>
+<p class="sub">AWS services that move the data · account 457360056131 · us-east-1</p>
+
+<svg viewBox="0 0 1120 640" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial">
+  <defs>
+    <marker id="ar" markerWidth="10" markerHeight="10" refX="9" refY="3.5" orient="auto">
+      <path d="M0,0 L0,7 L10,3.5 z" fill="#455a64"/></marker>
+    <marker id="gr" markerWidth="10" markerHeight="10" refX="9" refY="3.5" orient="auto">
+      <path d="M0,0 L0,7 L10,3.5 z" fill="#2e7d32"/></marker>
+    <marker id="or" markerWidth="10" markerHeight="10" refX="9" refY="3.5" orient="auto">
+      <path d="M0,0 L0,7 L10,3.5 z" fill="#c2410c"/></marker>
+    <marker id="pu" markerWidth="10" markerHeight="10" refX="9" refY="3.5" orient="auto">
+      <path d="M0,0 L0,7 L10,3.5 z" fill="#7e3ff2"/></marker>
+  </defs>
+
+  <!-- ========== SOURCES ========== -->
+  <rect x="20" y="250" width="118" height="96" rx="8" fill="#eceff1" stroke="#607d8b" stroke-width="2"/>
+  <text x="79" y="276" text-anchor="middle" font-size="12" font-weight="bold" fill="#37474f">SOURCES</text>
+  <text x="79" y="296" text-anchor="middle" font-size="9" fill="#455a64">Kafka</text>
+  <text x="79" y="312" text-anchor="middle" font-size="9" fill="#455a64">RDS / Aurora</text>
+  <text x="79" y="328" text-anchor="middle" font-size="9" fill="#455a64">APIs · files</text>
+
+  <line x1="138" y1="298" x2="186" y2="298" stroke="#455a64" stroke-width="2.4" marker-end="url(#ar)"/>
+
+  <!-- ========== S3 ========== -->
+  <rect x="190" y="196" width="200" height="212" rx="10" fill="#fff8ee" stroke="#FF9900" stroke-width="3"/>
+  <rect x="190" y="196" width="200" height="34" rx="10" fill="#FF9900"/>
+  <rect x="190" y="220" width="200" height="12" fill="#FF9900"/>
+  <text x="290" y="219" text-anchor="middle" font-size="13" font-weight="bold" fill="#fff">Amazon S3</text>
+
+  <rect x="204" y="244" width="172" height="66" rx="5" fill="#fff" stroke="#c9a24a" stroke-width="1.4"/>
+  <text x="212" y="261" font-size="9.5" font-weight="bold" fill="#7a5c10">raw/</text>
+  <text x="212" y="277" font-size="8.4" font-family="monospace" fill="#555">taxi/*.parquet</text>
+  <text x="212" y="291" font-size="8.4" font-family="monospace" fill="#555">events/*.parquet</text>
+  <text x="212" y="304" font-size="7.8" fill="#999">plain Parquet</text>
+
+  <rect x="204" y="318" width="172" height="76" rx="5" fill="#fff" stroke="#4a7fc9" stroke-width="1.4"/>
+  <text x="212" y="335" font-size="9.5" font-weight="bold" fill="#14508f">delta/</text>
+  <text x="212" y="350" font-size="8.4" font-family="monospace" fill="#555">trips/part-*.parquet</text>
+  <text x="212" y="365" font-size="8.4" font-family="monospace" fill="#c2410c">trips/_delta_log/*.json</text>
+  <text x="212" y="380" font-size="7.8" fill="#999">Delta = Parquet + log</text>
+
+  <!-- ========== GLUE CRAWLER ========== -->
+  <rect x="440" y="42" width="150" height="76" rx="8" fill="#e8f0fe" stroke="#4285f4" stroke-width="2"/>
+  <text x="515" y="64" text-anchor="middle" font-size="11" font-weight="bold" fill="#1a4d8f">AWS Glue</text>
+  <text x="515" y="80" text-anchor="middle" font-size="11" font-weight="bold" fill="#1a4d8f">Crawler</text>
+  <text x="515" y="99" text-anchor="middle" font-size="8.2" fill="#555">scans S3, infers schema</text>
+  <text x="515" y="111" text-anchor="middle" font-size="8.2" fill="#555">(scheduled)</text>
+
+  <!-- ========== GLUE CATALOG ========== -->
+  <rect x="640" y="42" width="150" height="76" rx="8" fill="#f3e8fd" stroke="#7e3ff2" stroke-width="2"/>
+  <text x="715" y="64" text-anchor="middle" font-size="11" font-weight="bold" fill="#4c1d95">AWS Glue</text>
+  <text x="715" y="80" text-anchor="middle" font-size="11" font-weight="bold" fill="#4c1d95">Data Catalog</text>
+  <text x="715" y="99" text-anchor="middle" font-size="8.2" fill="#555">table defs · schemas</text>
+  <text x="715" y="111" text-anchor="middle" font-size="8.2" fill="#555">partitions</text>
+
+  <line x1="590" y1="80" x2="636" y2="80" stroke="#4285f4" stroke-width="2.2" marker-end="url(#ar)"/>
+  <path d="M 300 196 L 300 80 L 436 80" fill="none" stroke="#4285f4" stroke-width="2.2" marker-end="url(#ar)"/>
+  <text x="330" y="72" font-size="8.2" fill="#4285f4">crawl</text>
+
+  <!-- ========== GLUE ETL ========== -->
+  <rect x="440" y="164" width="150" height="82" rx="8" fill="#e8f5e9" stroke="#2e7d32" stroke-width="2"/>
+  <text x="515" y="186" text-anchor="middle" font-size="11" font-weight="bold" fill="#1b5e20">AWS Glue</text>
+  <text x="515" y="202" text-anchor="middle" font-size="11" font-weight="bold" fill="#1b5e20">ETL Job</text>
+  <text x="515" y="221" text-anchor="middle" font-size="8.2" fill="#555">Spark · transform</text>
+  <text x="515" y="233" text-anchor="middle" font-size="8.2" fill="#555">writes to Redshift</text>
+
+  <line x1="392" y1="252" x2="436" y2="215" stroke="#2e7d32" stroke-width="2.2" marker-end="url(#gr)"/>
+
+  <!-- ========== COPY ========== -->
+  <rect x="440" y="266" width="150" height="72" rx="8" fill="#e8f5e9" stroke="#2e7d32" stroke-width="2.4"/>
+  <text x="515" y="290" text-anchor="middle" font-size="11.5" font-weight="bold" fill="#1b5e20">COPY command</text>
+  <text x="515" y="308" text-anchor="middle" font-size="8.2" fill="#555">native, parallel bulk load</text>
+  <text x="515" y="322" text-anchor="middle" font-size="8.2" fill="#2e7d32" font-weight="bold">← simplest, fastest</text>
+
+  <line x1="392" y1="290" x2="436" y2="296" stroke="#2e7d32" stroke-width="2.6" marker-end="url(#gr)"/>
+
+  <!-- ========== SPECTRUM ========== -->
+  <rect x="440" y="358" width="150" height="72" rx="8" fill="#fffde7" stroke="#f9a825" stroke-width="2"/>
+  <text x="515" y="382" text-anchor="middle" font-size="11" font-weight="bold" fill="#8a6d00">Redshift Spectrum</text>
+  <text x="515" y="400" text-anchor="middle" font-size="8.2" fill="#555">external table</text>
+  <text x="515" y="414" text-anchor="middle" font-size="8.2" fill="#555">NO copy — query in place</text>
+
+  <line x1="392" y1="330" x2="436" y2="382" stroke="#f9a825" stroke-width="2.2" marker-end="url(#ar)"/>
+  <path d="M 640 80 L 640 394 L 594 394" fill="none" stroke="#7e3ff2" stroke-width="1.8"
+        stroke-dasharray="5,3" marker-end="url(#pu)"/>
+  <text x="650" y="250" font-size="8" fill="#7e3ff2">uses catalog</text>
+
+  <!-- ========== REDSHIFT ========== -->
+  <rect x="856" y="196" width="242" height="150" rx="10" fill="#eaf1fb" stroke="#2f5fa8" stroke-width="3"/>
+  <rect x="856" y="196" width="242" height="34" rx="10" fill="#2f5fa8"/>
+  <rect x="856" y="220" width="242" height="12" fill="#2f5fa8"/>
+  <text x="977" y="219" text-anchor="middle" font-size="13" font-weight="bold" fill="#fff">Amazon Redshift</text>
+  <text x="977" y="252" text-anchor="middle" font-size="9.4" fill="#333">data stored INSIDE the cluster</text>
+  <text x="977" y="270" text-anchor="middle" font-size="8.6" font-family="monospace" fill="#555">DISTKEY · SORTKEY</text>
+  <rect x="874" y="282" width="206" height="26" rx="4" fill="#fff" stroke="#8fa9cf"/>
+  <text x="977" y="299" text-anchor="middle" font-size="8.6" fill="#444">internal tables (COPY loaded)</text>
+  <rect x="874" y="312" width="206" height="26" rx="4" fill="#fffde7" stroke="#e0c060"/>
+  <text x="977" y="329" text-anchor="middle" font-size="8.6" fill="#666">external tables (Spectrum → S3)</text>
+
+  <line x1="594" y1="205" x2="852" y2="240" stroke="#2e7d32" stroke-width="2.2" marker-end="url(#gr)"/>
+  <line x1="594" y1="300" x2="852" y2="286" stroke="#2e7d32" stroke-width="2.8" marker-end="url(#gr)"/>
+  <line x1="594" y1="400" x2="852" y2="326" stroke="#f9a825" stroke-width="2.2" marker-end="url(#ar)"/>
+
+  <!-- ========== DATABRICKS ========== -->
+  <rect x="856" y="404" width="242" height="150" rx="10" fill="#fdeee6" stroke="#c2410c" stroke-width="3"/>
+  <rect x="856" y="404" width="242" height="34" rx="10" fill="#c2410c"/>
+  <rect x="856" y="428" width="242" height="12" fill="#c2410c"/>
+  <text x="977" y="427" text-anchor="middle" font-size="13" font-weight="bold" fill="#fff">Databricks</text>
+  <text x="977" y="460" text-anchor="middle" font-size="9.4" fill="#333">compute only — NO data stored</text>
+  <rect x="874" y="472" width="206" height="26" rx="4" fill="#fff" stroke="#e0a884"/>
+  <text x="977" y="489" text-anchor="middle" font-size="8.6" fill="#444">Spark cluster · notebooks · jobs</text>
+  <rect x="874" y="502" width="206" height="26" rx="4" fill="#f3e8fd" stroke="#b98cf5"/>
+  <text x="977" y="519" text-anchor="middle" font-size="8.6" fill="#4c1d95">Unity Catalog (metadata only)</text>
+  <text x="977" y="544" text-anchor="middle" font-size="8.2" fill="#777">tables point AT the S3 path</text>
+
+  <!-- Databricks direct read/write to S3 -->
+  <path d="M 392 372 C 560 500, 700 520, 852 490" fill="none" stroke="#c2410c"
+        stroke-width="2.8" marker-end="url(#or)"/>
+  <path d="M 852 512 C 700 560, 560 540, 392 392" fill="none" stroke="#c2410c"
+        stroke-width="2.8" marker-end="url(#or)"/>
+  <rect x="566" y="486" width="188" height="44" rx="6" fill="#fff1e8" stroke="#c2410c" stroke-width="1.6"/>
+  <text x="660" y="504" text-anchor="middle" font-size="10.4" font-weight="bold" fill="#9a3412">S3 direct (IAM role)</text>
+  <text x="660" y="520" text-anchor="middle" font-size="8.3" fill="#9a3412">read raw · write Delta back</text>
+
+  <!-- Databricks -> Redshift connector -->
+  <path d="M 977 404 L 977 350" fill="none" stroke="#607d8b" stroke-width="1.8"
+        stroke-dasharray="5,3" marker-end="url(#ar)"/>
+  <text x="985" y="378" font-size="7.8" fill="#607d8b">JDBC connector (optional)</text>
+
+  <!-- ===== LEGEND ===== -->
+  <rect x="20" y="440" width="360" height="180" rx="8" fill="#f8f9fa" stroke="#bbb"/>
+  <text x="34" y="462" font-size="11" font-weight="bold" fill="#222">Four ways S3 → Redshift</text>
+
+  <rect x="34" y="472" width="12" height="12" rx="2" fill="#e8f5e9" stroke="#2e7d32" stroke-width="1.5"/>
+  <text x="54" y="482" font-size="9" fill="#222"><tspan font-weight="bold">COPY</tspan> — bulk load. Fastest. Data duplicated.</text>
+
+  <rect x="34" y="494" width="12" height="12" rx="2" fill="#e8f5e9" stroke="#2e7d32" stroke-width="1.5"/>
+  <text x="54" y="504" font-size="9" fill="#222"><tspan font-weight="bold">Glue ETL</tspan> — transform on the way in. Scheduled.</text>
+
+  <rect x="34" y="516" width="12" height="12" rx="2" fill="#fffde7" stroke="#f9a825" stroke-width="1.5"/>
+  <text x="54" y="526" font-size="9" fill="#222"><tspan font-weight="bold">Spectrum</tspan> — no copy, query S3 in place. Slower.</text>
+
+  <rect x="34" y="538" width="12" height="12" rx="2" fill="#eceff1" stroke="#607d8b" stroke-width="1.5"/>
+  <text x="54" y="548" font-size="9" fill="#222"><tspan font-weight="bold">Zero-ETL</tspan> — auto-replicate from Aurora/RDS.</text>
+
+  <line x1="34" y1="562" x2="366" y2="562" stroke="#ccc"/>
+  <text x="34" y="580" font-size="9.2" fill="#1b5e20">▸ Redshift <tspan font-weight="bold">copies data in</tspan> → 2nd copy exists</text>
+  <text x="34" y="597" font-size="9.2" fill="#9a3412">▸ Databricks <tspan font-weight="bold">leaves data in S3</tspan> → table IS the folder</text>
+  <text x="34" y="613" font-size="9.2" fill="#444">▸ Same bucket, different prefixes, no conflict</text>
+</svg>
+
+<!-- ================= PAGE 2 ================= -->
+<div class="page"></div>
+<h1>Data flow — who writes what, and when</h1>
+<p class="sub">Medallion layout in one bucket</p>
+
+<svg viewBox="0 0 1120 600" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial">
+  <defs>
+    <marker id="a2" markerWidth="10" markerHeight="10" refX="9" refY="3.5" orient="auto">
+      <path d="M0,0 L0,7 L10,3.5 z" fill="#455a64"/></marker>
+  </defs>
+
+  <!-- lanes -->
+  <rect x="20" y="60" width="1080" height="132" rx="8" fill="#fafafa" stroke="#ddd"/>
+  <rect x="20" y="204" width="1080" height="132" rx="8" fill="#f5f9ff" stroke="#ddd"/>
+  <rect x="20" y="348" width="1080" height="132" rx="8" fill="#f6fff5" stroke="#ddd"/>
+  <text x="34" y="82" font-size="10" font-weight="bold" fill="#8a5200">BRONZE — raw/</text>
+  <text x="34" y="226" font-size="10" font-weight="bold" fill="#14508f">SILVER — delta/</text>
+  <text x="34" y="370" font-size="10" font-weight="bold" fill="#1b5e20">GOLD — curated/</text>
+
+  <!-- BRONZE -->
+  <rect x="150" y="96" width="180" height="76" rx="7" fill="#fff8ee" stroke="#FF9900" stroke-width="2"/>
+  <text x="240" y="120" text-anchor="middle" font-size="10.5" font-weight="bold" fill="#8a5200">S3 raw/</text>
+  <text x="240" y="138" text-anchor="middle" font-size="8.4" font-family="monospace" fill="#555">taxi/*.parquet</text>
+  <text x="240" y="155" text-anchor="middle" font-size="8" fill="#999">landed as-is, never edited</text>
+
+  <text x="380" y="120" font-size="8.6" fill="#555">written by</text>
+  <rect x="380" y="126" width="150" height="42" rx="6" fill="#eceff1" stroke="#607d8b"/>
+  <text x="455" y="143" text-anchor="middle" font-size="9" fill="#37474f">Flink / Firehose /</text>
+  <text x="455" y="158" text-anchor="middle" font-size="9" fill="#37474f">Glue / aws s3 cp</text>
+
+  <!-- BRONZE -> SILVER -->
+  <path d="M 240 172 L 240 240" fill="none" stroke="#455a64" stroke-width="2.4" marker-end="url(#a2)"/>
+  <rect x="252" y="186" width="176" height="38" rx="5" fill="#fdeee6" stroke="#c2410c" stroke-width="1.6"/>
+  <text x="340" y="203" text-anchor="middle" font-size="9.4" font-weight="bold" fill="#9a3412">Databricks job</text>
+  <text x="340" y="217" text-anchor="middle" font-size="8.2" fill="#9a3412">clean · join · dedupe</text>
+
+  <!-- SILVER -->
+  <rect x="150" y="244" width="180" height="80" rx="7" fill="#fff" stroke="#4a7fc9" stroke-width="2"/>
+  <text x="240" y="266" text-anchor="middle" font-size="10.5" font-weight="bold" fill="#14508f">S3 delta/trips/</text>
+  <text x="240" y="283" text-anchor="middle" font-size="8.4" font-family="monospace" fill="#555">part-*.parquet</text>
+  <text x="240" y="298" text-anchor="middle" font-size="8.4" font-family="monospace" fill="#c2410c">_delta_log/*.json</text>
+  <text x="240" y="314" text-anchor="middle" font-size="8" fill="#999">ACID · time travel · MERGE</text>
+
+  <!-- SILVER -> GOLD -->
+  <path d="M 240 324 L 240 384" fill="none" stroke="#455a64" stroke-width="2.4" marker-end="url(#a2)"/>
+  <rect x="252" y="332" width="176" height="38" rx="5" fill="#fdeee6" stroke="#c2410c" stroke-width="1.6"/>
+  <text x="340" y="349" text-anchor="middle" font-size="9.4" font-weight="bold" fill="#9a3412">Databricks job</text>
+  <text x="340" y="363" text-anchor="middle" font-size="8.2" fill="#9a3412">aggregate → small</text>
+
+  <!-- GOLD -->
+  <rect x="150" y="388" width="180" height="76" rx="7" fill="#f1f8e9" stroke="#2e7d32" stroke-width="2"/>
+  <text x="240" y="412" text-anchor="middle" font-size="10.5" font-weight="bold" fill="#1b5e20">S3 curated/</text>
+  <text x="240" y="430" text-anchor="middle" font-size="8.4" font-family="monospace" fill="#555">daily_metrics/*.parquet</text>
+  <text x="240" y="447" text-anchor="middle" font-size="8" fill="#999">small · BI-ready</text>
+
+  <!-- GOLD -> REDSHIFT -->
+  <path d="M 330 424 L 560 424" fill="none" stroke="#2e7d32" stroke-width="2.8" marker-end="url(#a2)"/>
+  <rect x="380" y="400" width="140" height="42" rx="6" fill="#e8f5e9" stroke="#2e7d32" stroke-width="2"/>
+  <text x="450" y="418" text-anchor="middle" font-size="10" font-weight="bold" fill="#1b5e20">COPY</text>
+  <text x="450" y="433" text-anchor="middle" font-size="8.2" fill="#2e7d32">or Spectrum (no copy)</text>
+
+  <!-- REDSHIFT box -->
+  <rect x="566" y="372" width="200" height="108" rx="8" fill="#eaf1fb" stroke="#2f5fa8" stroke-width="2.4"/>
+  <text x="666" y="398" text-anchor="middle" font-size="11.5" font-weight="bold" fill="#1b3a70">Redshift</text>
+  <text x="666" y="419" text-anchor="middle" font-size="8.6" fill="#333">only the SMALL curated result</text>
+  <text x="666" y="437" text-anchor="middle" font-size="8.6" fill="#333">not the raw 3 TB</text>
+  <text x="666" y="459" text-anchor="middle" font-size="8.4" fill="#666">DISTKEY · SORTKEY tuned for BI</text>
+
+  <!-- BI -->
+  <rect x="806" y="372" width="180" height="108" rx="8" fill="#f8f9fa" stroke="#888" stroke-width="1.8"/>
+  <text x="896" y="398" text-anchor="middle" font-size="11" font-weight="bold" fill="#333">BI / Dashboards</text>
+  <text x="896" y="419" text-anchor="middle" font-size="8.6" fill="#555">QuickSight · Tableau</text>
+  <text x="896" y="436" text-anchor="middle" font-size="8.6" fill="#555">Power BI · Looker</text>
+  <text x="896" y="459" text-anchor="middle" font-size="8.4" fill="#777">sub-second SQL</text>
+  <line x1="766" y1="424" x2="802" y2="424" stroke="#455a64" stroke-width="2.4" marker-end="url(#a2)"/>
+
+  <!-- Databricks consumers on the right -->
+  <rect x="566" y="228" width="200" height="96" rx="8" fill="#fdeee6" stroke="#c2410c" stroke-width="2.4"/>
+  <text x="666" y="254" text-anchor="middle" font-size="11.5" font-weight="bold" fill="#9a3412">Databricks</text>
+  <text x="666" y="275" text-anchor="middle" font-size="8.6" fill="#333">ML training · ad-hoc</text>
+  <text x="666" y="292" text-anchor="middle" font-size="8.6" fill="#333">big transforms · notebooks</text>
+  <text x="666" y="312" text-anchor="middle" font-size="8.4" fill="#777">reads Delta directly from S3</text>
+  <line x1="336" y1="284" x2="562" y2="276" stroke="#c2410c" stroke-width="2.4" marker-end="url(#a2)"/>
+
+  <!-- Athena -->
+  <rect x="806" y="228" width="180" height="96" rx="8" fill="#f3e8fd" stroke="#7e3ff2" stroke-width="1.8"/>
+  <text x="896" y="254" text-anchor="middle" font-size="11" font-weight="bold" fill="#4c1d95">Athena</text>
+  <text x="896" y="275" text-anchor="middle" font-size="8.6" fill="#555">ad-hoc SQL on S3</text>
+  <text x="896" y="292" text-anchor="middle" font-size="8.6" fill="#555">via Glue Catalog</text>
+  <text x="896" y="312" text-anchor="middle" font-size="8.4" fill="#777">pay per TB scanned</text>
+  <line x1="766" y1="276" x2="802" y2="276" stroke="#455a64" stroke-width="2.2" marker-end="url(#a2)"/>
+
+  <!-- key point -->
+  <rect x="20" y="500" width="1080" height="80" rx="8" fill="#f8f9fa" stroke="#bbb" stroke-dasharray="5,3"/>
+  <text x="40" y="524" font-size="11" font-weight="bold" fill="#222">The point of this shape</text>
+  <text x="40" y="546" font-size="9.6" fill="#333">
+    ▸ <tspan font-weight="bold">Databricks does the heavy work</tspan> on the big data in S3 — it never leaves the lake.</text>
+  <text x="40" y="565" font-size="9.6" fill="#333">
+    ▸ <tspan font-weight="bold">Redshift only receives the small aggregated result</tspan> — so the cluster stays cheap and fast for BI.</text>
+  <text x="620" y="546" font-size="9.6" fill="#333">
+    ▸ One copy of the truth lives in S3.</text>
+  <text x="620" y="565" font-size="9.6" fill="#333">
+    ▸ Every engine reads open Parquet — no lock-in.</text>
+</svg>

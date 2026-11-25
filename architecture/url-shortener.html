@@ -1,0 +1,661 @@
+<meta charset="utf-8">
+<title>URL Shortener — System Design</title>
+<style>
+  @page { size: A4; margin: 14mm 13mm; }
+  body { font-family: -apple-system, "Helvetica Neue", Arial, sans-serif;
+         font-size: 10.2pt; line-height: 1.5; color: #16181d; margin: 0; }
+  h1 { font-size: 22pt; margin: 0 0 5pt; letter-spacing: -0.5pt; }
+  h2 { font-size: 15pt; margin: 0 0 8pt; padding: 5pt 0;
+       border-bottom: 2.5px solid #7c3aed; page-break-after: avoid; }
+  h3 { font-size: 11.4pt; margin: 13pt 0 4pt; color: #0b3d6b; page-break-after: avoid; }
+  h4 { font-size: 10.3pt; margin: 9pt 0 3pt; color: #333; page-break-after: avoid; }
+  p { margin: 5pt 0; }
+  ul, ol { margin: 5pt 0; padding-left: 17pt; }
+  li { margin: 2.5pt 0; }
+  code { font-family: "SF Mono", Menlo, monospace; font-size: 8.6pt;
+         background: #eef1f5; padding: 0.5pt 3pt; border-radius: 2px; }
+  pre { font-family: "SF Mono", Menlo, monospace; font-size: 8.1pt; line-height: 1.45;
+        background: #f6f8fa; border: 1px solid #d8dee4; border-left: 3px solid #7c3aed;
+        border-radius: 3px; padding: 7pt 9pt; white-space: pre-wrap;
+        page-break-inside: avoid; margin: 6pt 0; }
+  table { border-collapse: collapse; width: 100%; font-size: 8.8pt; margin: 6pt 0;
+          page-break-inside: avoid; }
+  th, td { border: 1px solid #c9d1d9; padding: 4pt 6pt; text-align: left; vertical-align: top; }
+  th { background: #eaeef2; font-weight: 600; }
+  .pg { page-break-before: always; }
+  .warn { background: #fdeeee; border-left: 3px solid #c62828; border: 1px solid #e0b4b4;
+          padding: 7pt 9pt; margin: 7pt 0; font-size: 9.4pt; page-break-inside: avoid; }
+  .why { background: #f5f0ff; border-left: 3px solid #7c3aed; border: 1px solid #c9b6f0;
+         padding: 7pt 9pt; margin: 7pt 0; font-size: 9.4pt; page-break-inside: avoid; }
+  .num { background: #eef2fb; border-left: 3px solid #2563eb; border: 1px solid #b7c4e2;
+         padding: 7pt 9pt; margin: 7pt 0; font-size: 9.4pt; page-break-inside: avoid; }
+  .cover { border: 3px solid #16181d; padding: 16pt; margin-bottom: 10pt; }
+  .small { font-size: 8.8pt; color: #444; }
+  svg { display: block; margin: 8pt auto; max-width: 100%; }
+  .cap { text-align: center; font-size: 8.3pt; color: #666; font-style: italic; margin-top: -3pt; }
+  .sec { display: inline-block; background: #16181d; color: #a78bfa; font-weight: 700;
+         padding: 1pt 8pt; border-radius: 3px; font-size: 10pt; margin-right: 6pt; }
+</style>
+
+<div class="cover">
+<h1>URL Shortener</h1>
+<p class="small" style="margin-top:2pt"><b>End-to-end system design.</b> The classic interview problem, done
+properly — capacity math, the key-generation decision, storage, caching, analytics, and the trade-offs that
+actually get probed.</p>
+<table>
+<tr><th style="width:20%">Problem</th><td>Turn a long URL into a short one. Redirect on access. Track clicks.</td></tr>
+<tr><th>Scale</th><td>100M new URLs/day · <b>10B redirects/day</b> · 100:1 read:write</td></tr>
+<tr><th>Hard parts</th><td>(1) Generating unique short codes at 1,160/sec without collisions.
+(2) Serving 350K redirects/sec at p99 &lt; 50 ms. (3) Analytics without slowing the redirect.</td></tr>
+<tr><th>Shape</th><td>Overwhelmingly <b>read-heavy KV lookup</b>. That single observation drives every
+storage and caching decision.</td></tr>
+</table>
+</div>
+
+<h3>Contents</h3>
+<table>
+<tr><td style="width:6%"><b>1</b></td><td>Requirements</td>
+    <td style="width:6%"><b>7</b></td><td>Caching</td></tr>
+<tr><td><b>2</b></td><td>Capacity estimation</td><td><b>8</b></td><td>The redirect — 301 vs 302</td></tr>
+<tr><td><b>3</b></td><td>API design</td><td><b>9</b></td><td>Analytics pipeline</td></tr>
+<tr><td><b>4</b></td><td><b>Key generation</b> — the core problem</td><td><b>10</b></td><td>Failure modes</td></tr>
+<tr><td><b>5</b></td><td>High-level architecture</td><td><b>11</b></td><td>Security &amp; abuse</td></tr>
+<tr><td><b>6</b></td><td>Data model &amp; storage</td><td><b>12</b></td><td>Cost &amp; trade-offs</td></tr>
+</table>
+
+<div class="why"><b>The one insight that structures the whole answer.</b> This is not a hard <i>computation</i>
+problem — it is a hard <i>lookup at scale</i> problem. Reads outnumber writes 100:1, the access pattern is a
+single key lookup with no joins, and the data is immutable once written. <b>That means: NoSQL over relational,
+cache-first, and a code-generation scheme that avoids coordination.</b></div>
+
+<!-- ============ 1 ============ -->
+<div class="pg"></div>
+<h2><span class="sec">1</span> Requirements</h2>
+
+<h3>Functional</h3>
+<table>
+<tr><td style="width:6%">F1</td><td>Given a long URL, return a short URL</td></tr>
+<tr><td>F2</td><td>Given a short URL, redirect to the original</td></tr>
+<tr><td>F3</td><td>Optional <b>custom alias</b> — <code>short.ly/my-campaign</code></td></tr>
+<tr><td>F4</td><td>Optional <b>expiry</b> — default 5 years, user-settable</td></tr>
+<tr><td>F5</td><td><b>Click analytics</b> — count, timestamp, referrer, geo, device</td></tr>
+<tr><td>F6</td><td>Users can list and delete their own links</td></tr>
+</table>
+
+<h3>Non-functional</h3>
+<table>
+<tr><th style="width:24%">Requirement</th><th style="width:20%">Target</th><th>Consequence</th></tr>
+<tr><td><b>Redirect latency</b></td><td><b>p99 &lt; 50 ms</b></td><td>A redirect sits in the critical path of a page load. Forces cache-first.</td></tr>
+<tr><td><b>Availability</b></td><td>99.99% for redirects</td><td>A dead link is worse than a slow one. Redirects matter more than creates.</td></tr>
+<tr><td>Creation latency</td><td>p99 &lt; 200 ms</td><td>Interactive but not critical-path</td></tr>
+<tr><td><b>Durability</b></td><td>No lost mappings</td><td>A lost mapping breaks every link ever shared</td></tr>
+<tr><td><b>Uniqueness</b></td><td>No collisions, ever</td><td>A collision sends a user to the wrong site — a security issue, not a bug</td></tr>
+<tr><td>Unpredictability</td><td>Codes not enumerable</td><td>Sequential codes let anyone scrape every link</td></tr>
+<tr><td>Scale</td><td>10B reads/day</td><td>~116K/sec average, ~350K/sec peak</td></tr>
+</table>
+
+<div class="warn"><b>Availability &gt; consistency here.</b> If a newly created short link takes two seconds
+to become visible in every region, nobody notices. If a redirect fails, a shared link is broken and the user
+blames the brand that shared it. <b>This is an AP system in CAP terms</b> — and saying so, with that
+justification, is the point.</div>
+
+<h3>Out of scope</h3>
+<ul>
+<li>Link preview / unfurling · A/B split-testing destinations · QR generation</li>
+<li>Editing a destination after creation — mappings are <b>immutable</b> (see §6 for why that matters)</li>
+</ul>
+
+<!-- ============ 2 ============ -->
+<div class="pg"></div>
+<h2><span class="sec">2</span> Capacity estimation</h2>
+
+<h3>Traffic</h3>
+<pre>New URLs per day                   100,000,000
+Read : write ratio                       100 : 1
+Redirects per day                   10,000,000,000
+
+Writes/sec  = 100e6 / 86,400              ≈ 1,160/sec
+Reads/sec   = 10e9  / 86,400              ≈ 116,000/sec
+Peak (3×)                                 ≈ 350,000/sec</pre>
+
+<h3>How long must the short code be?</h3>
+<pre>Alphabet: base62  [a-z A-Z 0-9]
+
+62^5 =            916 million      ← 9 days of capacity. No.
+62^6 =         56.8 billion        ← 1.5 years. No.
+62^7 =        3,521 billion        ← 96 years at 100M/day.  ✓
+62^8 =      218,000 billion        ← overkill, wastes 1 char
+
+→ 7 characters.  short.ly/aX9k2Bq</pre>
+
+<div class="num"><b>Do this calculation out loud in an interview.</b> It is the single most expected piece
+of arithmetic in this problem, and picking 7 without showing why 6 fails is a missed signal.</div>
+
+<h3>Storage</h3>
+<pre>Per record
+   short_code       7 B
+   long_url       ~200 B  (average; cap at 2 KB)
+   user_id         16 B
+   created_at       8 B
+   expires_at       8 B
+   metadata       ~60 B
+   ─────────────────────
+   ≈ 300 B, call it 500 B with index overhead
+
+Per day    100e6 × 500 B                  = 50 GB/day
+Per year                                  = 18 TB/year
+5 years                                   = 91 TB
+With replication (×3)                     = 273 TB</pre>
+
+<h3>Bandwidth &amp; memory</h3>
+<pre>Write  1,160/s × 500 B                    = 0.6 MB/s     trivial
+Read   116,000/s × 500 B                  = 58 MB/s      modest
+
+CACHE SIZING — apply the 80/20 rule
+  20% of URLs generate 80% of traffic.
+  Cache the hot 20% of one day's reads:
+     10e9 × 20%  = 2e9 requests → but distinct URLs are far fewer.
+
+  Practical approach: cache ~20% of daily-active distinct URLs
+     ~100e6 distinct hot URLs × 500 B    ≈ 50 GB
+  → a modest Redis cluster. Target 90%+ hit rate.</pre>
+
+<div class="why"><b>Notice what the numbers say.</b> Writes are trivial (1,160/sec — a single Postgres box
+could do it). Storage is large but not exotic. <b>The entire difficulty is 350K reads/sec at p99 &lt; 50 ms.</b>
+That is a caching and horizontal-read-scaling problem, and the design should say so explicitly rather than
+treating all three dimensions as equally hard.</div>
+
+<!-- ============ 3 ============ -->
+<div class="pg"></div>
+<h2><span class="sec">3</span> API design</h2>
+
+<pre>POST /api/v1/urls
+  Authorization: Bearer &lt;token&gt;
+  {
+    "long_url":     "https://example.com/some/very/long/path?a=1",
+    "custom_alias": "my-campaign",        // optional
+    "expires_at":   "2027-01-01T00:00:00Z" // optional
+  }
+  → 201 Created
+  {
+    "short_url":  "https://short.ly/aX9k2Bq",
+    "short_code": "aX9k2Bq",
+    "long_url":   "https://example.com/...",
+    "expires_at": "2031-08-11T00:00:00Z"
+  }
+  → 409 Conflict        custom alias already taken
+  → 400 Bad Request     malformed or blocked URL
+  → 429 Too Many        rate limited
+
+GET /{short_code}
+  → 302 Found
+    Location: https://example.com/some/very/long/path?a=1
+    Cache-Control: private, max-age=0
+  → 404 Not Found       unknown or expired
+  → 410 Gone            deleted by owner
+
+GET  /api/v1/urls/{short_code}/stats     → click analytics
+GET  /api/v1/urls?user_id=…&amp;cursor=…    → list, cursor-paginated
+DELETE /api/v1/urls/{short_code}          → 204, soft delete</pre>
+
+<h3>Rate limiting</h3>
+<table>
+<tr><td style="width:32%">Anonymous create</td><td>10 / hour / IP</td></tr>
+<tr><td>Authenticated create</td><td>1,000 / day / user</td></tr>
+<tr><td>Redirect</td><td><b>Not limited</b> — it is the product</td></tr>
+</table>
+<p class="small">Token bucket in Redis, keyed by IP or user. Return <code>429</code> with
+<code>Retry-After</code>.</p>
+
+<div class="warn"><b>Why the redirect endpoint is not versioned or namespaced.</b>
+<code>GET /{short_code}</code> lives at the root because every character counts — that is the entire product.
+The consequence is a <b>namespace collision risk</b> with real routes: <code>/api</code>, <code>/login</code>,
+<code>/health</code>. Maintain a <b>reserved-words blocklist</b> and exclude those strings from generation.</div>
+
+<!-- ============ 4 ============ -->
+<div class="pg"></div>
+<h2><span class="sec">4</span> Key generation — the core problem</h2>
+
+<p>Everything else in this design is standard. <b>This is the decision the interview is actually about.</b></p>
+
+<h3>Option A — Hash the URL, truncate</h3>
+<pre>code = base62( md5(long_url) )[:7]</pre>
+<table>
+<tr><td style="width:14%">✓</td><td>Stateless. Same URL always yields the same code — natural deduplication.</td></tr>
+<tr><td>✗</td><td><b>Collisions are certain.</b> Birthday paradox: with 3.5e12 space, expect the first
+collision around √(3.5e12) ≈ 1.9M URLs. At 100M/day that is <b>every few minutes</b>.</td></tr>
+<tr><td>✗</td><td>Resolving a collision needs a read-before-write, which is a round trip on the hot path.</td></tr>
+</table>
+
+<h3>Option B — Global counter, base62 encoded</h3>
+<pre>code = base62( atomic_increment(counter) )</pre>
+<table>
+<tr><td style="width:14%">✓</td><td>Zero collisions by construction. Compact.</td></tr>
+<tr><td>✗</td><td><b>Enumerable.</b> Code <code>N</code> implies <code>N−1</code> exists. Anyone can scrape
+every link ever created — a serious privacy failure.</td></tr>
+<tr><td>✗</td><td>The counter is a <b>single point of contention</b> at 1,160 writes/sec.</td></tr>
+</table>
+
+<h3>Option C — Key Generation Service (pre-generated keys)</h3>
+<pre>A separate service pre-generates random unique 7-char keys offline
+and stores them in two tables:  unused_keys  |  used_keys
+
+App servers claim a BLOCK of ~1,000 keys at a time, hold them in
+memory, and hand them out with no per-request coordination.</pre>
+<table>
+<tr><td style="width:14%">✓</td><td>No collisions — uniqueness is guaranteed at generation time</td></tr>
+<tr><td>✓</td><td>Not enumerable — keys are random</td></tr>
+<tr><td>✓</td><td><b>No coordination on the hot path.</b> Key assignment is a memory read</td></tr>
+<tr><td>✗</td><td>Another service to run. Keys are lost if a server dies mid-block (acceptable — the space is
+3.5 trillion)</td></tr>
+</table>
+
+<h3>Option D — Distributed ID (Snowflake) + base62</h3>
+<pre>64-bit ID = [41 bits timestamp][10 bits machine][12 bits sequence]
+code = base62(id)   → but this is 11 chars, and time-ordered = enumerable
+Fix by XOR-ing with a secret, or Feistel-permuting the ID space.</pre>
+
+<div class="why"><b>Recommendation: Option C, the Key Generation Service.</b> It is the only design that
+gets all three properties simultaneously — <b>collision-free, unpredictable, and coordination-free on the
+write path</b>. Hashing fails on collisions, counters fail on enumerability, and Snowflake needs an extra
+permutation step to fix ordering.<br><br>
+Being able to articulate <i>why the other three fail</i> matters more than naming the winner.</div>
+
+<h3>Custom aliases</h3>
+<pre>Custom aliases bypass the KGS entirely and go straight to a
+conditional insert:
+
+   PutItem(short_code = 'my-campaign',
+           ConditionExpression = 'attribute_not_exists(short_code)')
+
+→ 409 Conflict on failure.
+Validate against the reserved-words blocklist first.</pre>
+
+<!-- ============ 5 ============ -->
+<div class="pg"></div>
+<h2><span class="sec">5</span> High-level architecture</h2>
+
+<svg viewBox="0 0 720 430" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial" font-size="8.6">
+  <defs>
+    <marker id="a" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#455a64"/></marker>
+    <marker id="ap" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#7c3aed"/></marker>
+    <marker id="ag" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#2e7d32"/></marker>
+  </defs>
+
+  <!-- clients -->
+  <rect x="12" y="176" width="76" height="66" rx="6" fill="#eceff1" stroke="#607d8b" stroke-width="1.8"/>
+  <text x="50" y="198" text-anchor="middle" font-size="9.4" font-weight="bold" fill="#37474f">CLIENTS</text>
+  <text x="50" y="214" text-anchor="middle" fill="#555">browsers</text>
+  <text x="50" y="228" text-anchor="middle" fill="#555">apps · bots</text>
+  <line x1="88" y1="209" x2="112" y2="209" stroke="#455a64" stroke-width="2" marker-end="url(#a)"/>
+
+  <!-- CDN / LB -->
+  <rect x="114" y="170" width="82" height="78" rx="6" fill="#e3f2fd" stroke="#1565c0" stroke-width="2"/>
+  <text x="155" y="192" text-anchor="middle" font-size="9.2" font-weight="bold" fill="#0d47a1">CDN + LB</text>
+  <text x="155" y="208" text-anchor="middle" fill="#555">geo-routing</text>
+  <text x="155" y="222" text-anchor="middle" fill="#555">TLS · DDoS</text>
+  <text x="155" y="238" text-anchor="middle" font-size="7.8" fill="#0d47a1">rate limit</text>
+  <line x1="196" y1="190" x2="222" y2="150" stroke="#2e7d32" stroke-width="2" marker-end="url(#ag)"/>
+  <line x1="196" y1="228" x2="222" y2="268" stroke="#7c3aed" stroke-width="2" marker-end="url(#ap)"/>
+
+  <!-- READ PATH -->
+  <text x="228" y="112" font-size="9" font-weight="bold" fill="#2e7d32">READ PATH — 350K/sec peak</text>
+  <rect x="224" y="120" width="96" height="62" rx="6" fill="#e8f5e9" stroke="#2e7d32" stroke-width="2"/>
+  <text x="272" y="142" text-anchor="middle" font-size="9" font-weight="bold" fill="#1b5e20">Redirect svc</text>
+  <text x="272" y="158" text-anchor="middle" fill="#555">stateless</text>
+  <text x="272" y="172" text-anchor="middle" fill="#555">autoscaled</text>
+  <line x1="320" y1="151" x2="346" y2="151" stroke="#2e7d32" stroke-width="2" marker-end="url(#ag)"/>
+
+  <rect x="348" y="120" width="92" height="62" rx="6" fill="#ffebee" stroke="#c62828" stroke-width="2.2"/>
+  <text x="394" y="140" text-anchor="middle" font-size="9" font-weight="bold" fill="#b71c1c">REDIS</text>
+  <text x="394" y="155" text-anchor="middle" fill="#555">~50 GB LRU</text>
+  <text x="394" y="170" text-anchor="middle" font-size="8" font-weight="bold" fill="#b71c1c">90%+ hit rate</text>
+  <line x1="440" y1="151" x2="466" y2="151" stroke="#455a64" stroke-width="1.6"
+        stroke-dasharray="4,3" marker-end="url(#a)"/>
+  <text x="453" y="144" text-anchor="middle" font-size="7" fill="#777">miss</text>
+
+  <!-- WRITE PATH -->
+  <text x="228" y="264" font-size="9" font-weight="bold" fill="#7c3aed">WRITE PATH — 1,160/sec</text>
+  <rect x="224" y="272" width="96" height="62" rx="6" fill="#f5f0ff" stroke="#7c3aed" stroke-width="2"/>
+  <text x="272" y="294" text-anchor="middle" font-size="9" font-weight="bold" fill="#5b21b6">Create svc</text>
+  <text x="272" y="310" text-anchor="middle" fill="#555">validate URL</text>
+  <text x="272" y="324" text-anchor="middle" fill="#555">safety check</text>
+  <line x1="272" y1="334" x2="272" y2="360" stroke="#7c3aed" stroke-width="2" marker-end="url(#ap)"/>
+  <line x1="320" y1="298" x2="466" y2="200" stroke="#7c3aed" stroke-width="2" marker-end="url(#ap)"/>
+
+  <!-- KGS -->
+  <rect x="212" y="364" width="120" height="52" rx="6" fill="#fff8e1" stroke="#c9a227" stroke-width="2"/>
+  <text x="272" y="384" text-anchor="middle" font-size="9" font-weight="bold" fill="#7a5c10">KEY GEN SERVICE</text>
+  <text x="272" y="399" text-anchor="middle" fill="#666">pre-generated keys</text>
+  <text x="272" y="411" text-anchor="middle" font-size="7.8" fill="#7a5c10">claimed in 1K blocks</text>
+
+  <!-- DB -->
+  <rect x="468" y="150" width="118" height="76" rx="6" fill="#fff3e0" stroke="#e65100" stroke-width="2.4"/>
+  <text x="527" y="172" text-anchor="middle" font-size="9.4" font-weight="bold" fill="#bf360c">DynamoDB</text>
+  <text x="527" y="188" text-anchor="middle" fill="#555">PK = short_code</text>
+  <text x="527" y="202" text-anchor="middle" fill="#555">91 TB · 5 yrs</text>
+  <text x="527" y="217" text-anchor="middle" font-size="7.8" fill="#bf360c">multi-region, TTL</text>
+
+  <!-- analytics -->
+  <line x1="272" y1="182" x2="272" y2="196" stroke="#455a64" stroke-width="0"/>
+  <path d="M 300 182 C 340 210, 380 236, 418 250" fill="none" stroke="#455a64"
+        stroke-width="1.8" stroke-dasharray="4,3" marker-end="url(#a)"/>
+  <text x="352" y="226" font-size="7.4" fill="#777">async, fire-and-forget</text>
+
+  <rect x="420" y="240" width="92" height="52" rx="6" fill="#f3e8fd" stroke="#7e3ff2" stroke-width="1.8"/>
+  <text x="466" y="260" text-anchor="middle" font-size="8.8" font-weight="bold" fill="#4c1d95">KAFKA</text>
+  <text x="466" y="275" text-anchor="middle" fill="#666">click events</text>
+  <text x="466" y="286" text-anchor="middle" font-size="7.4" fill="#999">350K/sec</text>
+  <line x1="512" y1="266" x2="536" y2="266" stroke="#455a64" stroke-width="1.8" marker-end="url(#a)"/>
+
+  <rect x="538" y="240" width="92" height="52" rx="6" fill="#fff8e1" stroke="#F5C000" stroke-width="1.8"/>
+  <text x="584" y="260" text-anchor="middle" font-size="8.8" font-weight="bold" fill="#3a2c00">ClickHouse</text>
+  <text x="584" y="275" text-anchor="middle" fill="#666">click analytics</text>
+  <text x="584" y="286" text-anchor="middle" font-size="7.4" fill="#999">rollups</text>
+
+  <!-- cache fill back -->
+  <path d="M 470 196 C 440 206, 410 200, 400 186" fill="none" stroke="#c62828"
+        stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#a)"/>
+  <text x="440" y="212" font-size="7" fill="#c62828">populate</text>
+
+  <rect x="606" y="120" width="102" height="76" rx="6" fill="#f8f9fa" stroke="#888" stroke-width="1.6"/>
+  <text x="657" y="142" text-anchor="middle" font-size="8.8" font-weight="bold" fill="#333">Safety svc</text>
+  <text x="657" y="158" text-anchor="middle" font-size="7.8" fill="#666">Safe Browsing</text>
+  <text x="657" y="171" text-anchor="middle" font-size="7.8" fill="#666">phishing lists</text>
+  <text x="657" y="186" text-anchor="middle" font-size="7.4" fill="#999">async re-scan</text>
+
+  <text x="360" y="424" text-anchor="middle" font-size="8.4" fill="#666">
+    Read and write paths scale independently — 100:1 ratio means they are effectively different systems.</text>
+</svg>
+<p class="cap">Cache-first read path · KGS removes coordination from the write path · analytics is fully async.</p>
+
+<!-- ============ 6 ============ -->
+<div class="pg"></div>
+<h2><span class="sec">6</span> Data model &amp; storage</h2>
+
+<h3>Why NoSQL, not a relational database</h3>
+<table>
+<tr><th style="width:30%">Property of this workload</th><th>Consequence</th></tr>
+<tr><td>Single-key lookup, no joins</td><td>Relational features are unused overhead</td></tr>
+<tr><td>Records immutable after write</td><td>No update contention, no transaction needs</td></tr>
+<tr><td>91 TB, growing 18 TB/year</td><td>Must shard. NoSQL does it natively; RDBMS needs manual sharding</td></tr>
+<tr><td>350K reads/sec</td><td>Horizontal read scale is the whole requirement</td></tr>
+<tr><td>Availability &gt; consistency</td><td>Eventual consistency is acceptable and cheaper</td></tr>
+</table>
+
+<div class="why"><b>DynamoDB or Cassandra.</b> The access pattern is <i>literally</i> a key-value get. A
+relational database would work at small scale and become the bottleneck at this one — and you would spend
+your time building the sharding layer that DynamoDB gives you for free.</div>
+
+<h3>Schema</h3>
+<pre>TABLE urls
+  short_code    STRING   ← PARTITION KEY.  High cardinality, uniform
+                            distribution → no hot partitions by design
+  long_url      STRING
+  user_id       STRING
+  created_at    NUMBER
+  expires_at    NUMBER   ← DynamoDB TTL: automatic deletion, no cron job
+  is_deleted    BOOL
+  click_count   NUMBER   ← denormalised, updated async
+
+GSI  user_id-created_at-index    → "list my links", cursor paginated</pre>
+
+<div class="num"><b>The partition key choice is the entire scalability story.</b> <code>short_code</code> is
+random base62, so keys distribute perfectly uniformly across partitions. There is no hot key, no rebalancing,
+no resharding — <b>by construction, not by tuning</b>. Contrast with partitioning by <code>user_id</code>,
+where one viral account would melt a single partition.</div>
+
+<h3>Why mappings are immutable</h3>
+<p>Allowing a destination to be edited turns a shortener into a <b>redirect-hijacking tool</b> — share a link
+to a news article, then repoint it at malware after it has spread. Immutability is a <b>security decision</b>,
+not a simplification. Deletion is a soft delete returning <code>410 Gone</code>.</p>
+
+<h3>Sharding, if using Cassandra rather than a managed store</h3>
+<pre>shard = consistent_hash(short_code) % N
+
+Consistent hashing so adding a node moves ~1/N of keys, not all of them.
+Replication factor 3, spread across availability zones.
+Reads at CL=ONE (fast, eventually consistent — correct for this workload).</pre>
+
+<!-- ============ 7 ============ -->
+<div class="pg"></div>
+<h2><span class="sec">7</span> Caching</h2>
+
+<h3>The read path</h3>
+<pre>GET /aX9k2Bq
+   │
+   ▼  1. Redis GET aX9k2Bq
+   ├── HIT  (90%+)  → return 302 immediately          ~1 ms
+   │
+   └── MISS
+        ▼  2. DynamoDB GetItem(short_code)            ~10 ms
+        ├── found   → SETEX into Redis, return 302
+        └── missing → 404, and cache the negative result briefly</pre>
+
+<h3>Cache design decisions</h3>
+<table>
+<tr><td style="width:26%"><b>Eviction</b></td><td><b>LRU.</b> Access is strongly recency-correlated — a link goes viral, then dies. LRU matches that shape exactly.</td></tr>
+<tr><td><b>TTL</b></td><td>24 hours. Entries are immutable, so a long TTL is safe. TTL exists to bound memory, not for correctness.</td></tr>
+<tr><td><b>Size</b></td><td>~50 GB across a Redis cluster. Sized from the 80/20 estimate in §2.</td></tr>
+<tr><td><b>Negative caching</b></td><td>Cache 404s for ~60 s. Otherwise a scanner probing random codes drives 100% cache misses straight into the database.</td></tr>
+<tr><td><b>Warming</b></td><td>Pre-populate on create — the creator is likely to click it first.</td></tr>
+</table>
+
+<div class="warn"><b>Two failure modes to name unprompted.</b><br><br>
+<b>Cache stampede.</b> A viral link expires from cache; 50,000 concurrent requests all miss and hit the
+database simultaneously. <b>Fix:</b> request coalescing (single-flight) — the first miss fetches, the rest
+wait on that one promise.<br><br>
+<b>Cold-start thundering herd.</b> A Redis node restarts empty and the full read load lands on DynamoDB.
+<b>Fix:</b> replicas, gradual traffic ramp, and a database provisioned to survive a period of low hit rate.</div>
+
+<h3>CDN edge caching</h3>
+<p>A 302 with a short <code>Cache-Control</code> can be cached at the CDN edge for the hottest links,
+absorbing traffic before it reaches your infrastructure at all. <b>The trade-off is analytics fidelity</b> —
+edge-cached redirects are invisible to you unless the CDN streams its logs back. For a link that is being
+shared millions of times an hour, that trade is usually worth it.</p>
+
+<!-- ============ 8 ============ -->
+<div class="pg"></div>
+<h2><span class="sec">8</span> The redirect — 301 vs 302</h2>
+
+<p>A small question that reveals whether someone has thought about the product.</p>
+
+<table>
+<tr><th style="width:22%"></th><th style="width:39%">301 Moved Permanently</th><th>302 Found <span class="small">(or 307)</span></th></tr>
+<tr><td><b>Browser behaviour</b></td><td><b>Caches the redirect.</b> Subsequent clicks never reach your server</td><td>Asks your server every time</td></tr>
+<tr><td><b>Your traffic</b></td><td>Dramatically lower</td><td>Full load — every click</td></tr>
+<tr><td><b>Analytics</b></td><td><b>Broken.</b> You see the first click and nothing after</td><td>Complete</td></tr>
+<tr><td><b>Reversibility</b></td><td><b>Effectively permanent</b> — cached in browsers you cannot reach</td><td>Fully reversible</td></tr>
+<tr><td><b>SEO</b></td><td>Passes link equity to the destination</td><td>Does not</td></tr>
+</table>
+
+<div class="why"><b>Use 302 (or 307).</b> Click analytics is a core feature — F5 in the requirements — and
+301 destroys it. The deeper reason is <b>reversibility</b>: if a link is later found to point at malware, a
+301 is cached in millions of browsers you have no way to reach. With 302 you disable it and the next click
+is blocked.<br><br>
+<b>307 over 302 if method preservation matters</b> — 302 historically allowed clients to convert POST to
+GET; 307 forbids it. For a link shortener the distinction rarely bites, but knowing it is the difference
+between a memorised answer and an understood one.</div>
+
+<pre>HTTP/1.1 302 Found
+Location: https://example.com/some/very/long/path
+Cache-Control: private, no-store        ← stop intermediaries caching it
+Referrer-Policy: unsafe-url             ← preserve referrer for the destination
+X-Content-Type-Options: nosniff</pre>
+
+<!-- ============ 9 ============ -->
+<div class="pg"></div>
+<h2><span class="sec">9</span> Analytics pipeline</h2>
+
+<div class="warn"><b>The critical constraint: analytics must never slow the redirect.</b> At 350K/sec, a
+synchronous write per click would double your latency and couple redirect availability to analytics
+availability. <b>Fire-and-forget into a queue, always.</b></div>
+
+<pre>Redirect service
+   │  emit click event, non-blocking, ~0.1 ms
+   ▼
+KAFKA  topic: click_events, partitioned by short_code
+   │     { short_code, ts, ip, user_agent, referrer, country }
+   ▼
+Stream processor  (Flink / Kafka Streams)
+   ├─▶ enrich: IP → geo, UA → device/browser
+   ├─▶ bot filtering
+   └─▶ windowed aggregation
+   ▼
+ClickHouse
+   ├── clicks_raw        90-day retention, per-event
+   └── clicks_hourly     materialized view rollup, kept forever</pre>
+
+<h3>ClickHouse schema for the analytics side</h3>
+<pre>CREATE TABLE clicks_hourly (
+    short_code  String,
+    hour        DateTime,
+    country     LowCardinality(String),
+    device      LowCardinality(String),
+    clicks      UInt64
+) ENGINE = SummingMergeTree
+ORDER BY (short_code, hour, country, device);
+
+CREATE MATERIALIZED VIEW mv_hourly TO clicks_hourly AS
+SELECT short_code, toStartOfHour(ts) AS hour, country, device, count() AS clicks
+FROM clicks_raw GROUP BY short_code, hour, country, device;</pre>
+
+<p><code>ORDER BY</code> leads with <code>short_code</code> because every stats query filters on it — the
+sparse index prunes to one link's granules immediately.</p>
+
+<h3>The denormalised click counter</h3>
+<pre>Do NOT increment click_count in DynamoDB on every redirect —
+that turns an immutable record into a hot write at 350K/sec.
+
+Instead: a stream consumer batches counts and updates DynamoDB
+every ~60 s. The counter is approximate and eventually consistent.
+Exact counts come from ClickHouse when asked.</pre>
+
+<div class="why"><b>Bot traffic is 30–50% of clicks on a real shortener.</b> Filtering it in the stream — user
+agent, request patterns, known crawler IP ranges — is a product requirement, not a nicety. Reporting inflated
+numbers to a customer is worse than reporting nothing.</div>
+
+<!-- ============ 10 ============ -->
+<div class="pg"></div>
+<h2><span class="sec">10</span> Failure modes</h2>
+
+<table>
+<tr><th style="width:22%">Failure</th><th style="width:20%">Impact</th><th>Mitigation</th></tr>
+<tr><td><b>Redis cluster down</b></td><td>Latency spikes; DB load ×10</td><td>DynamoDB must be provisioned to survive it. Circuit-break to DB, ramp cache back gradually.</td></tr>
+<tr><td><b>DynamoDB partition throttle</b></td><td>Some 500s</td><td>Random <code>short_code</code> means uniform distribution — this should not happen by design. Exponential backoff, on-demand capacity.</td></tr>
+<tr><td><b>KGS unavailable</b></td><td><b>Creates fail; redirects fine</b></td><td>App servers hold a 1,000-key buffer — that is ~15 minutes of runway at 1,160/sec. Alert when the buffer drops below 20%.</td></tr>
+<tr><td><b>Kafka down</b></td><td>Analytics gap only</td><td><b>Redirects continue.</b> This is the payoff for making analytics async. Buffer locally, accept some loss.</td></tr>
+<tr><td><b>Region outage</b></td><td>Regional</td><td>Multi-region active-active. DynamoDB global tables. DNS/anycast failover.</td></tr>
+<tr><td><b>Hot link (viral)</b></td><td>One key at 100K/sec</td><td>Cache absorbs it. CDN edge cache for the extreme tail. Nothing reaches the database.</td></tr>
+<tr><td><b>Scanner enumerating codes</b></td><td>100% cache miss → DB load</td><td><b>Negative caching</b> + rate limiting + random codes making enumeration futile</td></tr>
+</table>
+
+<h3>What to monitor</h3>
+<pre>REDIRECT   p50/p99 latency · 4xx and 5xx rate · requests/sec
+CACHE      hit rate  ◀── the leading indicator. Below 85% = investigate now
+DATABASE   read/write capacity consumed · throttles · p99
+KGS        available key buffer  ◀── alert at 20%, creates fail at 0
+ANALYTICS  Kafka consumer lag · events dropped
+BUSINESS   creates/hour and redirects/hour vs 7-day baseline
+           ◀── catches silent failure that every technical metric misses</pre>
+
+<div class="why"><b>Cache hit rate is the metric to watch first.</b> Everything downstream — database load,
+p99 latency, cost — is a function of it. A drop from 92% to 80% means <b>2.5× the database traffic</b>, and
+it will show up in the hit-rate graph before it shows up as user-visible latency.</div>
+
+<!-- ============ 11 ============ -->
+<div class="pg"></div>
+<h2><span class="sec">11</span> Security &amp; abuse</h2>
+
+<div class="warn"><b>Shorteners are an abuse magnet.</b> They hide the destination — which is precisely what
+phishing and malware campaigns want. Any serious design must address this, and most candidates never mention
+it.</div>
+
+<h3>At creation time</h3>
+<table>
+<tr><td style="width:28%"><b>URL validation</b></td><td>Scheme must be http/https. Reject <code>javascript:</code>, <code>data:</code>, <code>file:</code></td></tr>
+<tr><td><b>SSRF protection</b></td><td>Resolve the host and <b>reject private IP ranges</b> — <code>127.0.0.0/8</code>, <code>10/8</code>, <code>169.254.169.254</code> (cloud metadata). Re-check after redirects.</td></tr>
+<tr><td><b>Safe Browsing</b></td><td>Check against Google Safe Browsing / PhishTank at creation</td></tr>
+<tr><td><b>Shortener chaining</b></td><td>Reject URLs pointing at other shorteners — they defeat scanning</td></tr>
+<tr><td><b>Reserved words</b></td><td>Block <code>/api</code>, <code>/login</code>, <code>/admin</code>, <code>/health</code>, plus offensive strings</td></tr>
+</table>
+
+<h3>Continuously, after creation</h3>
+<p>A URL that was clean at creation can be weaponised later — this is the standard attack. <b>Re-scan
+asynchronously</b>, prioritising links by click volume, and disable on a hit. Because the redirect is a 302,
+disabling takes effect on the very next click.</p>
+
+<h3>At redirect time</h3>
+<pre>Known-bad → serve an interstitial warning page, not a redirect
+Unknown   → optional interstitial for links younger than N minutes
+All       → strip credentials from the URL, set Referrer-Policy
+</pre>
+
+<h3>Privacy</h3>
+<ul>
+<li><b>Codes must be unpredictable</b> — otherwise every link ever created is enumerable. This is why the
+counter approach in §4 is rejected on privacy grounds, not just aesthetics.</li>
+<li><b>Short links are not access control.</b> Anyone with the code has access. Say this explicitly — users
+routinely assume otherwise and shorten sensitive documents.</li>
+<li>IP addresses in click logs are personal data. Truncate or hash, and set a retention policy.</li>
+</ul>
+
+<!-- ============ 12 ============ -->
+<div class="pg"></div>
+<h2><span class="sec">12</span> Cost &amp; trade-offs</h2>
+
+<h3>Rough monthly cost at this scale</h3>
+<pre>DynamoDB   91 TB storage                              ~$23,000/mo
+           reads 10B/day on-demand                    ~$75,000/mo   ◀── dominant
+           (reserved capacity cuts this substantially)
+Redis      50 GB cluster, multi-AZ                     ~$3,000/mo
+Compute    redirect + create services, autoscaled      ~$8,000/mo
+CDN        58 MB/s egress                             ~$12,000/mo
+Kafka                                                  ~$4,000/mo
+ClickHouse analytics, 3 nodes                          ~$2,000/mo
+──────────────────────────────────────────────────────────────
+TOTAL                                                ~$127,000/mo</pre>
+
+<div class="num"><b>Database reads dominate — which makes cache hit rate a cost lever, not just a latency
+lever.</b> Moving from 90% to 95% hit rate <b>halves</b> the database read bill. That single sentence
+reframes caching from a performance optimisation to the primary cost control, and it is the kind of
+observation that distinguishes a senior answer.</div>
+
+<h3>Trade-offs made, and when they would flip</h3>
+<table>
+<tr><th style="width:24%">Decision</th><th style="width:34%">Reasoning</th><th>Would change if…</th></tr>
+<tr><td><b>NoSQL over SQL</b></td><td>Pure KV access, no joins, horizontal scale needed</td><td>Scale were 1000× smaller — Postgres would be simpler</td></tr>
+<tr><td><b>KGS over hashing</b></td><td>Collision-free and unpredictable without hot-path coordination</td><td>Deduplication of identical URLs were a hard requirement — hashing gives that free</td></tr>
+<tr><td><b>302 over 301</b></td><td>Analytics and revocability</td><td>Analytics were not a feature and cost mattered more</td></tr>
+<tr><td><b>Async analytics</b></td><td>Must not couple redirect latency to analytics availability</td><td>Never. This one is not negotiable at this scale</td></tr>
+<tr><td><b>7-char codes</b></td><td>96 years of headroom at 100M/day</td><td>Vanity mattered more — 6 chars, accept a 1.5-year horizon and a plan</td></tr>
+<tr><td><b>Immutable mappings</b></td><td>Prevents redirect hijacking</td><td>Never. It is a security property</td></tr>
+</table>
+
+<h3>Known limitations</h3>
+<ul>
+<li><b>No deduplication.</b> The same long URL submitted twice yields two codes. Adding a secondary index on
+<code>hash(long_url)</code> would fix it at the cost of a write-path lookup — usually not worth it, since
+users often <i>want</i> distinct codes for distinct campaigns.</li>
+<li><b>Click counts are approximate</b> in DynamoDB and eventually consistent. Exact figures come from
+ClickHouse.</li>
+<li><b>Edge-cached redirects are invisible</b> to analytics unless CDN logs are ingested.</li>
+<li><b>No link editing</b>, by design.</li>
+</ul>
+
+<h3>How to open the answer in an interview</h3>
+<div class="why">"This is a read-heavy key-value lookup problem — 100:1 reads to writes, single-key access,
+no joins, and records that are immutable once written. So the interesting parts are <b>how we generate codes
+that are unique and unpredictable without coordinating on every write</b>, and <b>how we serve 350K
+redirects a second at p99 under 50 ms</b>. Let me size it first, then work through key generation, because
+that is where the real design decision lives."<br><br>
+<b>Naming the shape of the problem before drawing boxes</b> is what separates a structured answer from a
+recital.</div>
+
+<p class="small" style="margin-top:14pt; border-top:1px solid #ccc; padding-top:6pt">
+Capacity figures follow the standard interview assumptions — 100M new URLs/day, 100:1 read:write. Costs are
+order-of-magnitude US-East estimates and vary substantially with reserved capacity and negotiated rates.
+</p>

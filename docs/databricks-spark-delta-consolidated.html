@@ -1,0 +1,1141 @@
+<meta charset="utf-8">
+<title>Databricks — Spark &amp; Delta, Step by Step</title>
+<style>
+  @page { size: A4; margin: 14mm 13mm; }
+  body { font-family: -apple-system, "Helvetica Neue", Arial, sans-serif;
+         font-size: 10.2pt; line-height: 1.48; color: #16181d; margin: 0; }
+  h1 { font-size: 22pt; margin: 0 0 4pt; letter-spacing: -0.5pt; }
+  h2 { font-size: 15pt; margin: 0 0 8pt; padding: 5pt 0;
+       border-bottom: 2.5px solid #FF3621; page-break-after: avoid; }
+  h3 { font-size: 11.3pt; margin: 11pt 0 4pt; color: #0b3d6b; page-break-after: avoid; }
+  p { margin: 5pt 0; }
+  ul, ol { margin: 5pt 0; padding-left: 17pt; }
+  li { margin: 2.5pt 0; }
+  code { font-family: "SF Mono", Menlo, monospace; font-size: 8.7pt;
+         background: #eef1f5; padding: 0.5pt 3pt; border-radius: 2px; }
+  pre { font-family: "SF Mono", Menlo, monospace; font-size: 8.2pt; line-height: 1.42;
+        background: #f6f8fa; border: 1px solid #d8dee4; border-left: 3px solid #FF3621;
+        border-radius: 3px; padding: 7pt 9pt; white-space: pre-wrap;
+        page-break-inside: avoid; margin: 6pt 0; }
+  table { border-collapse: collapse; width: 100%; font-size: 8.9pt; margin: 6pt 0;
+          page-break-inside: avoid; }
+  th, td { border: 1px solid #c9d1d9; padding: 4pt 6pt; text-align: left; vertical-align: top; }
+  th { background: #eaeef2; font-weight: 600; }
+  .step { page-break-before: always; }
+  .warn { background: #fdeeee; border-left: 3px solid #c62828; border: 1px solid #e0b4b4;
+          padding: 7pt 9pt; margin: 7pt 0; font-size: 9.4pt; page-break-inside: avoid; }
+  .why { background: #eef7ee; border-left: 3px solid #2e7d32; border: 1px solid #b9d9b9;
+         padding: 7pt 9pt; margin: 7pt 0; font-size: 9.4pt; page-break-inside: avoid; }
+  .iv { background: #eef2fb; border-left: 3px solid #1a3d8f; border: 1px solid #b7c4e2;
+        padding: 7pt 9pt; margin: 7pt 0; font-size: 9.4pt; page-break-inside: avoid; }
+  .cover { border: 3px solid #16181d; padding: 16pt; margin-bottom: 10pt; }
+  .small { font-size: 8.8pt; color: #444; }
+  svg { display: block; margin: 8pt auto; max-width: 100%; }
+  .cap { text-align: center; font-size: 8.4pt; color: #666; font-style: italic; margin-top: -3pt; }
+  .n { display: inline-block; background: #16181d; color: #FF3621; font-weight: 700;
+       padding: 1pt 8pt; border-radius: 3px; font-size: 10pt; margin-right: 6pt; }
+  .toc td:first-child { width: 34pt; font-weight: 700; }
+</style>
+
+<div class="cover">
+<h1>Databricks — Spark &amp; Delta</h1>
+<p class="small" style="margin-top:2pt"><b>Step by step, with the architecture drawn properly.</b>
+Consolidated from the <i>Complete Spark + Delta Architecture Guide</i> and the
+<i>Deep-Dive Interview Handbook</i> — deduplicated, reordered into a learning path, and every diagram redrawn.</p>
+<table>
+<tr><th style="width:22%">Mental model</th><td>Spark plans <b>partitions</b>; one task processes one partition per
+stage; tasks run on <b>executor cores</b>; shuffles create new partitioning and stage boundaries; Delta makes
+file storage <b>transactional and versioned</b>.</td></tr>
+<tr><th>Running example</th><td>1 TB of Parquet in S3, aggregated by region, written to a Delta table.
+Carried through every section.</td></tr>
+<tr><th>Use for</th><td>Learning the internals, and being able to draw them on a whiteboard.</td></tr>
+</table>
+</div>
+
+<h3>Contents</h3>
+<table class="toc">
+<tr><td colspan="2" style="background:#f4f6f8"><b>PART 1 — SPARK EXECUTION</b></td></tr>
+<tr><td>1</td><td>The whole picture: submit → output</td></tr>
+<tr><td>2</td><td>Driver, worker, executor, core</td></tr>
+<tr><td>3</td><td>How 1 TB in S3 becomes input partitions</td></tr>
+<tr><td>4</td><td>Partition → task → core, and waves</td></tr>
+<tr><td>5</td><td>Jobs, stages, DAG, and the shuffle boundary</td></tr>
+<tr><td>6</td><td>groupBy across executors — the part that confuses everyone</td></tr>
+<tr><td colspan="2" style="background:#f4f6f8"><b>PART 2 — DELTA LAKE</b></td></tr>
+<tr><td>7</td><td>Delta table anatomy and <code>_delta_log</code></td></tr>
+<tr><td>8</td><td>MERGE / upsert on immutable files</td></tr>
+<tr><td>9</td><td>Time travel, SCD1 and SCD2</td></tr>
+<tr><td>10</td><td>Small files, OPTIMIZE, VACUUM, Z-Order</td></tr>
+<tr><td colspan="2" style="background:#f4f6f8"><b>PART 3 — PRODUCTION</b></td></tr>
+<tr><td>11</td><td>Joins, skew, and AQE</td></tr>
+<tr><td>12</td><td>Medallion architecture</td></tr>
+<tr><td>13</td><td>Auto Loader, streaming, checkpoints</td></tr>
+<tr><td>14</td><td>Performance debugging: 20 minutes → 2 hours</td></tr>
+<tr><td colspan="2" style="background:#f4f6f8"><b>PART 4 — INTERVIEW</b></td></tr>
+<tr><td>15</td><td>20 questions with model answers</td></tr>
+<tr><td>16</td><td>One-page memory sheet</td></tr>
+</table>
+
+<div class="why"><b>The single sentence to hold onto.</b> Separate <b>compute</b> from <b>data layout</b>.
+Executors provide task slots; partitions define units of work; stages are separated by shuffle boundaries; and
+Delta makes cloud files transactional and versioned. Almost every question below is a detail of that sentence.</div>
+
+<!-- ============ 1 ============ -->
+<div class="step"></div>
+<h2><span class="n">1</span> The whole picture: submit → output</h2>
+
+<svg viewBox="0 0 700 200" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial" font-size="9">
+  <defs><marker id="a1" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto">
+    <path d="M0,0 L0,6 L9,3 z" fill="#455a64"/></marker></defs>
+  <rect x="8" y="70" width="78" height="46" rx="5" fill="#eceff1" stroke="#607d8b" stroke-width="1.6"/>
+  <text x="47" y="90" text-anchor="middle" font-weight="bold" fill="#37474f">Your code</text>
+  <text x="47" y="104" text-anchor="middle" font-size="7.6" fill="#666">DataFrame ops</text>
+  <line x1="86" y1="93" x2="106" y2="93" stroke="#455a64" stroke-width="1.8" marker-end="url(#a1)"/>
+
+  <rect x="108" y="70" width="74" height="46" rx="5" fill="#fff3e0" stroke="#e65100" stroke-width="1.6"/>
+  <text x="145" y="90" text-anchor="middle" font-weight="bold" fill="#bf360c">Lazy plan</text>
+  <text x="145" y="104" text-anchor="middle" font-size="7.6" fill="#666">nothing runs</text>
+  <line x1="182" y1="93" x2="202" y2="93" stroke="#455a64" stroke-width="1.8" marker-end="url(#a1)"/>
+
+  <rect x="204" y="62" width="80" height="62" rx="5" fill="#ffebee" stroke="#c62828" stroke-width="2"/>
+  <text x="244" y="82" text-anchor="middle" font-weight="bold" fill="#b71c1c">ACTION</text>
+  <text x="244" y="96" text-anchor="middle" font-size="7.6" fill="#666">write / count</text>
+  <text x="244" y="109" text-anchor="middle" font-size="7.6" fill="#666">collect / show</text>
+  <line x1="284" y1="93" x2="304" y2="93" stroke="#455a64" stroke-width="1.8" marker-end="url(#a1)"/>
+
+  <rect x="306" y="46" width="86" height="94" rx="5" fill="#e3f2fd" stroke="#1565c0" stroke-width="2"/>
+  <text x="349" y="64" text-anchor="middle" font-weight="bold" fill="#0d47a1">DRIVER</text>
+  <text x="349" y="80" text-anchor="middle" font-size="7.6" fill="#555">Catalyst optimise</text>
+  <text x="349" y="94" text-anchor="middle" font-size="7.6" fill="#555">physical plan</text>
+  <text x="349" y="108" text-anchor="middle" font-size="7.6" fill="#555">build DAG</text>
+  <text x="349" y="122" text-anchor="middle" font-size="7.6" fill="#555">cut into stages</text>
+  <line x1="392" y1="93" x2="412" y2="93" stroke="#455a64" stroke-width="1.8" marker-end="url(#a1)"/>
+
+  <rect x="414" y="54" width="80" height="78" rx="5" fill="#f3e5f5" stroke="#6a1b9a" stroke-width="1.6"/>
+  <text x="454" y="72" text-anchor="middle" font-weight="bold" fill="#4a148c">STAGES</text>
+  <text x="454" y="88" text-anchor="middle" font-size="7.6" fill="#555">1 task per</text>
+  <text x="454" y="100" text-anchor="middle" font-size="7.6" fill="#555">partition</text>
+  <text x="454" y="118" text-anchor="middle" font-size="7.4" fill="#888">split at shuffle</text>
+  <line x1="494" y1="93" x2="514" y2="93" stroke="#455a64" stroke-width="1.8" marker-end="url(#a1)"/>
+
+  <rect x="516" y="54" width="80" height="78" rx="5" fill="#e8f5e9" stroke="#2e7d32" stroke-width="1.6"/>
+  <text x="556" y="72" text-anchor="middle" font-weight="bold" fill="#1b5e20">EXECUTORS</text>
+  <text x="556" y="88" text-anchor="middle" font-size="7.6" fill="#555">cores run tasks</text>
+  <text x="556" y="102" text-anchor="middle" font-size="7.6" fill="#555">read · compute</text>
+  <text x="556" y="116" text-anchor="middle" font-size="7.6" fill="#555">shuffle · write</text>
+  <line x1="596" y1="93" x2="616" y2="93" stroke="#455a64" stroke-width="1.8" marker-end="url(#a1)"/>
+
+  <rect x="618" y="70" width="74" height="46" rx="5" fill="#fff8ee" stroke="#FF9900" stroke-width="1.8"/>
+  <text x="655" y="90" text-anchor="middle" font-weight="bold" fill="#8a5200">Delta</text>
+  <text x="655" y="104" text-anchor="middle" font-size="7.6" fill="#666">commit version</text>
+
+  <text x="350" y="172" text-anchor="middle" font-size="8.6" fill="#666">
+    Resources answer "where can work run?" · Partitions answer "what work must run?"</text>
+  <text x="350" y="186" text-anchor="middle" font-size="8.6" fill="#666">
+    Stages answer "which tasks can run together before data must move?"</text>
+</svg>
+<p class="cap">The execution chain. Everything in this document is a detail of one of these boxes.</p>
+
+<div class="why"><b>Why laziness matters.</b> The driver does not execute transformations as you write them. It
+accumulates a plan. Only when an <b>action</b> demands materialisation does Spark optimise the whole chain at
+once and turn it into executable work. That is what lets Catalyst push filters into the scan, prune columns,
+and reorder operations before a single byte is read.</div>
+
+<h3>The three layers to name in an interview</h3>
+<table>
+<tr><td><b>Driver</b></td><td>Plans and schedules. Holds the DAG, task metadata, broadcast metadata.</td></tr>
+<tr><td><b>Partitions</b></td><td>Data-level parallelism. Logical units of work.</td></tr>
+<tr><td><b>Executor cores</b></td><td>Compute-level parallelism. Task slots.</td></tr>
+</table>
+
+<!-- ============ 2 ============ -->
+<div class="step"></div>
+<h2><span class="n">2</span> Driver, worker, executor, core</h2>
+
+<svg viewBox="0 0 700 260" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial" font-size="9">
+  <defs><marker id="a2" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto">
+    <path d="M0,0 L0,6 L9,3 z" fill="#1565c0"/></marker></defs>
+
+  <rect x="20" y="90" width="118" height="80" rx="6" fill="#e3f2fd" stroke="#1565c0" stroke-width="2.4"/>
+  <text x="79" y="112" text-anchor="middle" font-size="11" font-weight="bold" fill="#0d47a1">DRIVER</text>
+  <text x="79" y="130" text-anchor="middle" font-size="7.8" fill="#555">SparkSession</text>
+  <text x="79" y="144" text-anchor="middle" font-size="7.8" fill="#555">plans · schedules</text>
+  <text x="79" y="158" text-anchor="middle" font-size="7.8" fill="#555">tracks task status</text>
+
+  <line x1="138" y1="112" x2="196" y2="70"  stroke="#1565c0" stroke-width="1.8" marker-end="url(#a2)"/>
+  <line x1="138" y1="130" x2="196" y2="130" stroke="#1565c0" stroke-width="1.8" marker-end="url(#a2)"/>
+  <line x1="138" y1="148" x2="196" y2="190" stroke="#1565c0" stroke-width="1.8" marker-end="url(#a2)"/>
+  <text x="164" y="88" font-size="7.4" fill="#1565c0">tasks</text>
+
+  <!-- worker 1 -->
+  <rect x="200" y="34" width="230" height="72" rx="6" fill="#f1f8e9" stroke="#558b2f" stroke-width="1.8"/>
+  <text x="212" y="50" font-size="8.6" font-weight="bold" fill="#33691e">WORKER NODE 1 (a VM)</text>
+  <rect x="212" y="56" width="206" height="42" rx="4" fill="#fff" stroke="#2e7d32" stroke-width="1.6"/>
+  <text x="222" y="70" font-size="8.2" font-weight="bold" fill="#1b5e20">Executor (a JVM process)</text>
+  <rect x="222" y="76" width="40" height="16" rx="2" fill="#c8e6c9" stroke="#2e7d32"/>
+  <text x="242" y="87" text-anchor="middle" font-size="7.2" fill="#1b5e20">core 1</text>
+  <rect x="266" y="76" width="40" height="16" rx="2" fill="#c8e6c9" stroke="#2e7d32"/>
+  <text x="286" y="87" text-anchor="middle" font-size="7.2" fill="#1b5e20">core 2</text>
+  <rect x="310" y="76" width="100" height="16" rx="2" fill="#f9fbe7" stroke="#9e9d24"/>
+  <text x="360" y="87" text-anchor="middle" font-size="7.2" fill="#827717">memory (exec + storage)</text>
+
+  <!-- worker 2 -->
+  <rect x="200" y="112" width="230" height="72" rx="6" fill="#f1f8e9" stroke="#558b2f" stroke-width="1.8"/>
+  <text x="212" y="128" font-size="8.6" font-weight="bold" fill="#33691e">WORKER NODE 2</text>
+  <rect x="212" y="134" width="206" height="42" rx="4" fill="#fff" stroke="#2e7d32" stroke-width="1.6"/>
+  <text x="222" y="148" font-size="8.2" font-weight="bold" fill="#1b5e20">Executor</text>
+  <rect x="222" y="154" width="40" height="16" rx="2" fill="#c8e6c9" stroke="#2e7d32"/>
+  <text x="242" y="165" text-anchor="middle" font-size="7.2" fill="#1b5e20">core 1</text>
+  <rect x="266" y="154" width="40" height="16" rx="2" fill="#c8e6c9" stroke="#2e7d32"/>
+  <text x="286" y="165" text-anchor="middle" font-size="7.2" fill="#1b5e20">core 2</text>
+  <rect x="310" y="154" width="100" height="16" rx="2" fill="#f9fbe7" stroke="#9e9d24"/>
+  <text x="360" y="165" text-anchor="middle" font-size="7.2" fill="#827717">memory</text>
+
+  <!-- worker 3 -->
+  <rect x="200" y="190" width="230" height="60" rx="6" fill="#f1f8e9" stroke="#558b2f" stroke-width="1.8"/>
+  <text x="212" y="206" font-size="8.6" font-weight="bold" fill="#33691e">WORKER NODE 3 …</text>
+  <rect x="212" y="212" width="206" height="30" rx="4" fill="#fff" stroke="#2e7d32" stroke-width="1.6"/>
+  <text x="315" y="231" text-anchor="middle" font-size="8" fill="#1b5e20">Executor · cores · memory</text>
+
+  <!-- definitions panel -->
+  <rect x="448" y="34" width="238" height="216" rx="6" fill="#f8f9fa" stroke="#aaa"/>
+  <text x="460" y="54" font-size="9.6" font-weight="bold" fill="#222">Precise definitions</text>
+  <text x="460" y="74" font-size="8.4" fill="#333"><tspan font-weight="bold">Worker node</tspan> — the machine/VM.</text>
+  <text x="460" y="94" font-size="8.4" fill="#333"><tspan font-weight="bold">Executor</tspan> — a JVM process on that</text>
+  <text x="460" y="106" font-size="8.4" fill="#333">machine. Runs tasks, holds cache and</text>
+  <text x="460" y="118" font-size="8.4" fill="#333">shuffle data.</text>
+  <text x="460" y="138" font-size="8.4" fill="#333"><tspan font-weight="bold">Core</tspan> — one task slot. 4 cores ≈ 4</text>
+  <text x="460" y="150" font-size="8.4" fill="#333">concurrent tasks.</text>
+  <text x="460" y="170" font-size="8.4" fill="#333"><tspan font-weight="bold">Partition</tspan> — a logical chunk of data.</text>
+  <text x="460" y="182" font-size="8.4" fill="#333">NOT owned by any executor.</text>
+  <line x1="460" y1="196" x2="676" y2="196" stroke="#ccc"/>
+  <text x="460" y="214" font-size="8.4" font-weight="bold" fill="#c62828">Do not say:</text>
+  <text x="460" y="228" font-size="8.2" fill="#c62828">"7-node cluster = 1 master + 6 executors"</text>
+  <text x="460" y="242" font-size="8.2" fill="#666">Databricks compute modes vary.</text>
+</svg>
+
+<div class="warn"><b>The mistake that costs interviews.</b> Executor sizing does <i>not</i> decide that
+"executor 1 owns the first chunk of the file". <b>Compute capacity and partition layout are separate
+concerns.</b> The scheduler can run the task for any partition on any suitable free executor.</div>
+
+<div class="iv"><b>Interview answer.</b> "The driver coordinates; executors compute; cores provide concurrency;
+partitions are logical units of data and are not permanently attached to executors."</div>
+
+<!-- ============ 3 ============ -->
+<div class="step"></div>
+<h2><span class="n">3</span> How 1 TB in S3 becomes input partitions</h2>
+
+<svg viewBox="0 0 700 240" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial" font-size="9">
+  <defs><marker id="a3" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto">
+    <path d="M0,0 L0,6 L9,3 z" fill="#455a64"/></marker></defs>
+
+  <rect x="18" y="60" width="140" height="120" rx="7" fill="#fff8ee" stroke="#FF9900" stroke-width="2.4"/>
+  <text x="88" y="82" text-anchor="middle" font-size="10.5" font-weight="bold" fill="#8a5200">S3 bucket</text>
+  <text x="88" y="98" text-anchor="middle" font-size="8" fill="#666">~1 TB Parquet</text>
+  <rect x="32" y="108" width="112" height="13" rx="2" fill="#fff" stroke="#c9a24a"/>
+  <text x="88" y="118" text-anchor="middle" font-size="7" fill="#555">part-0001.parquet (256 MB)</text>
+  <rect x="32" y="124" width="112" height="13" rx="2" fill="#fff" stroke="#c9a24a"/>
+  <text x="88" y="134" text-anchor="middle" font-size="7" fill="#555">part-0002.parquet (256 MB)</text>
+  <rect x="32" y="140" width="112" height="13" rx="2" fill="#fff" stroke="#c9a24a"/>
+  <text x="88" y="150" text-anchor="middle" font-size="7" fill="#555">… thousands more</text>
+  <text x="88" y="168" text-anchor="middle" font-size="7.4" fill="#999">S3 stores OBJECTS</text>
+
+  <line x1="158" y1="120" x2="204" y2="120" stroke="#455a64" stroke-width="2" marker-end="url(#a3)"/>
+  <text x="181" y="112" text-anchor="middle" font-size="7.2" fill="#666">list +</text>
+  <text x="181" y="134" text-anchor="middle" font-size="7.2" fill="#666">metadata</text>
+
+  <rect x="206" y="66" width="146" height="108" rx="7" fill="#e3f2fd" stroke="#1565c0" stroke-width="2"/>
+  <text x="279" y="88" text-anchor="middle" font-size="10" font-weight="bold" fill="#0d47a1">Scan planning</text>
+  <text x="279" y="106" text-anchor="middle" font-size="7.8" fill="#555">file sizes</text>
+  <text x="279" y="120" text-anchor="middle" font-size="7.8" fill="#555">splittability</text>
+  <text x="279" y="134" text-anchor="middle" font-size="7.8" fill="#555">maxPartitionBytes</text>
+  <text x="279" y="148" text-anchor="middle" font-size="7.8" fill="#555">pruned partitions</text>
+  <text x="279" y="164" text-anchor="middle" font-size="7.4" fill="#0d47a1">Spark defines PARTITIONS</text>
+
+  <line x1="352" y1="120" x2="398" y2="120" stroke="#455a64" stroke-width="2" marker-end="url(#a3)"/>
+
+  <rect x="400" y="52" width="122" height="136" rx="7" fill="#f3e5f5" stroke="#6a1b9a" stroke-width="2"/>
+  <text x="461" y="72" text-anchor="middle" font-size="9.6" font-weight="bold" fill="#4a148c">Input partitions</text>
+  <rect x="412" y="82" width="98" height="15" rx="2" fill="#fff" stroke="#9c6bb5"/>
+  <text x="461" y="93" text-anchor="middle" font-size="7.2" fill="#4a148c">P0 → task 0</text>
+  <rect x="412" y="100" width="98" height="15" rx="2" fill="#fff" stroke="#9c6bb5"/>
+  <text x="461" y="111" text-anchor="middle" font-size="7.2" fill="#4a148c">P1 → task 1</text>
+  <rect x="412" y="118" width="98" height="15" rx="2" fill="#fff" stroke="#9c6bb5"/>
+  <text x="461" y="129" text-anchor="middle" font-size="7.2" fill="#4a148c">P2 → task 2</text>
+  <rect x="412" y="136" width="98" height="15" rx="2" fill="#fff" stroke="#9c6bb5"/>
+  <text x="461" y="147" text-anchor="middle" font-size="7.2" fill="#4a148c">… Pn</text>
+  <text x="461" y="172" text-anchor="middle" font-size="7.4" fill="#888">~4000 for 1 TB @ 256 MB</text>
+
+  <rect x="536" y="66" width="150" height="108" rx="7" fill="#e8f5e9" stroke="#2e7d32" stroke-width="2"/>
+  <text x="611" y="88" text-anchor="middle" font-size="9.6" font-weight="bold" fill="#1b5e20">Executors read</text>
+  <text x="611" y="106" text-anchor="middle" font-size="7.8" fill="#555">only THEIR byte ranges</text>
+  <text x="611" y="122" text-anchor="middle" font-size="7.8" fill="#555">directly from S3</text>
+  <text x="611" y="142" text-anchor="middle" font-size="7.8" fill="#c62828">data never passes</text>
+  <text x="611" y="154" text-anchor="middle" font-size="7.8" fill="#c62828">through the driver</text>
+  <line x1="522" y1="120" x2="532" y2="120" stroke="#455a64" stroke-width="2" marker-end="url(#a3)"/>
+
+  <text x="350" y="216" text-anchor="middle" font-size="8.6" fill="#666">
+    One S3 object ≠ one Spark partition. A big splittable file yields several splits;</text>
+  <text x="350" y="230" text-anchor="middle" font-size="8.6" fill="#666">
+    many tiny files may be packed into one partition.</text>
+</svg>
+
+<div class="why"><b>Why not load the 1 TB first?</b> Distributed systems move <i>computation</i> to
+independently readable pieces of data. Each task reads only the bytes it needs, transforms those rows, and
+emits output or shuffle data. Thousands of tasks proceed in parallel and no single executor ever holds the
+whole dataset.</div>
+
+<h3>The four meanings of "partition" — the reason this gets confusing</h3>
+<table>
+<tr><th style="width:26%">Term</th><th style="width:30%">When it appears</th><th>What it is</th></tr>
+<tr><td><b>Input partitions</b></td><td>Scan planning, before reading</td><td>Logical chunks of source data that become read tasks</td></tr>
+<tr><td><b>DataFrame partitions</b></td><td>As transformations define a dataset</td><td>Logical divisions of that dataset</td></tr>
+<tr><td><b>Shuffle partitions</b></td><td>At a wide operation / Exchange</td><td>New buckets created by redistributing across the cluster</td></tr>
+<tr><td><b>Output partitions</b></td><td>During write</td><td>Physical files and directory partitions — <b>not</b> the same as task partitions</td></tr>
+</table>
+
+<!-- ============ 4 ============ -->
+<div class="step"></div>
+<h2><span class="n">4</span> Partition → task → core, and waves</h2>
+
+<svg viewBox="0 0 700 250" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial" font-size="9">
+  <defs><marker id="a4" markerWidth="8" markerHeight="8" refX="7" refY="2.6" orient="auto">
+    <path d="M0,0 L0,5.2 L8,2.6 z" fill="#6a1b9a"/></marker>
+    <marker id="a4b" markerWidth="8" markerHeight="8" refX="7" refY="2.6" orient="auto">
+    <path d="M0,0 L0,5.2 L8,2.6 z" fill="#2e7d32"/></marker></defs>
+
+  <text x="70" y="28" text-anchor="middle" font-size="9.4" font-weight="bold" fill="#4a148c">PARTITIONS</text>
+  <text x="240" y="28" text-anchor="middle" font-size="9.4" font-weight="bold" fill="#4a148c">TASKS (this stage)</text>
+  <text x="470" y="28" text-anchor="middle" font-size="9.4" font-weight="bold" fill="#1b5e20">EXECUTOR CORES</text>
+
+  <g font-size="7.6">
+  <rect x="20" y="40" width="100" height="22" rx="3" fill="#f3e5f5" stroke="#6a1b9a"/><text x="70" y="55" text-anchor="middle" fill="#4a148c">Partition 0</text>
+  <rect x="20" y="68" width="100" height="22" rx="3" fill="#f3e5f5" stroke="#6a1b9a"/><text x="70" y="83" text-anchor="middle" fill="#4a148c">Partition 1</text>
+  <rect x="20" y="96" width="100" height="22" rx="3" fill="#f3e5f5" stroke="#6a1b9a"/><text x="70" y="111" text-anchor="middle" fill="#4a148c">Partition 2</text>
+  <rect x="20" y="124" width="100" height="22" rx="3" fill="#f3e5f5" stroke="#6a1b9a"/><text x="70" y="139" text-anchor="middle" fill="#4a148c">Partition 3</text>
+  <rect x="20" y="152" width="100" height="22" rx="3" fill="#fce4ec" stroke="#ad1457" stroke-width="1.5"/><text x="70" y="167" text-anchor="middle" fill="#880e4f">Partition 4</text>
+
+  <rect x="190" y="40" width="100" height="22" rx="3" fill="#ede7f6" stroke="#5e35b1"/><text x="240" y="55" text-anchor="middle" fill="#311b92">Task 0</text>
+  <rect x="190" y="68" width="100" height="22" rx="3" fill="#ede7f6" stroke="#5e35b1"/><text x="240" y="83" text-anchor="middle" fill="#311b92">Task 1</text>
+  <rect x="190" y="96" width="100" height="22" rx="3" fill="#ede7f6" stroke="#5e35b1"/><text x="240" y="111" text-anchor="middle" fill="#311b92">Task 2</text>
+  <rect x="190" y="124" width="100" height="22" rx="3" fill="#ede7f6" stroke="#5e35b1"/><text x="240" y="139" text-anchor="middle" fill="#311b92">Task 3</text>
+  <rect x="190" y="152" width="100" height="22" rx="3" fill="#fce4ec" stroke="#ad1457" stroke-width="1.5"/><text x="240" y="167" text-anchor="middle" fill="#880e4f">Task 4</text>
+  </g>
+
+  <line x1="120" y1="51"  x2="186" y2="51"  stroke="#6a1b9a" stroke-width="1.5" marker-end="url(#a4)"/>
+  <line x1="120" y1="79"  x2="186" y2="79"  stroke="#6a1b9a" stroke-width="1.5" marker-end="url(#a4)"/>
+  <line x1="120" y1="107" x2="186" y2="107" stroke="#6a1b9a" stroke-width="1.5" marker-end="url(#a4)"/>
+  <line x1="120" y1="135" x2="186" y2="135" stroke="#6a1b9a" stroke-width="1.5" marker-end="url(#a4)"/>
+  <line x1="120" y1="163" x2="186" y2="163" stroke="#ad1457" stroke-width="1.5" marker-end="url(#a4)"/>
+  <text x="153" y="46" text-anchor="middle" font-size="6.8" fill="#6a1b9a">1:1</text>
+
+  <!-- executors -->
+  <rect x="400" y="36" width="140" height="66" rx="5" fill="#e8f5e9" stroke="#2e7d32" stroke-width="1.8"/>
+  <text x="470" y="52" text-anchor="middle" font-size="8.6" font-weight="bold" fill="#1b5e20">Executor 1</text>
+  <rect x="412" y="58" width="54" height="16" rx="2" fill="#ede7f6" stroke="#5e35b1"/>
+  <text x="439" y="69" text-anchor="middle" font-size="7" fill="#311b92">core → T0</text>
+  <rect x="474" y="58" width="54" height="16" rx="2" fill="#ede7f6" stroke="#5e35b1"/>
+  <text x="501" y="69" text-anchor="middle" font-size="7" fill="#311b92">core → T1</text>
+  <text x="470" y="92" text-anchor="middle" font-size="7.2" fill="#666">2 cores = 2 concurrent tasks</text>
+
+  <rect x="400" y="112" width="140" height="66" rx="5" fill="#e8f5e9" stroke="#2e7d32" stroke-width="1.8"/>
+  <text x="470" y="128" text-anchor="middle" font-size="8.6" font-weight="bold" fill="#1b5e20">Executor 2</text>
+  <rect x="412" y="134" width="54" height="16" rx="2" fill="#ede7f6" stroke="#5e35b1"/>
+  <text x="439" y="145" text-anchor="middle" font-size="7" fill="#311b92">core → T2</text>
+  <rect x="474" y="134" width="54" height="16" rx="2" fill="#ede7f6" stroke="#5e35b1"/>
+  <text x="501" y="145" text-anchor="middle" font-size="7" fill="#311b92">core → T3</text>
+  <text x="470" y="168" text-anchor="middle" font-size="7.2" fill="#666">all 4 slots busy</text>
+
+  <line x1="290" y1="51"  x2="396" y2="64"  stroke="#2e7d32" stroke-width="1.4" marker-end="url(#a4b)"/>
+  <line x1="290" y1="79"  x2="396" y2="68"  stroke="#2e7d32" stroke-width="1.4" marker-end="url(#a4b)"/>
+  <line x1="290" y1="107" x2="396" y2="138" stroke="#2e7d32" stroke-width="1.4" marker-end="url(#a4b)"/>
+  <line x1="290" y1="135" x2="396" y2="142" stroke="#2e7d32" stroke-width="1.4" marker-end="url(#a4b)"/>
+
+  <!-- wave 2 -->
+  <rect x="380" y="192" width="300" height="44" rx="5" fill="#fce4ec" stroke="#ad1457" stroke-width="1.8"/>
+  <text x="530" y="210" text-anchor="middle" font-size="9" font-weight="bold" fill="#880e4f">WAVE 2 — Task 4 WAITS</text>
+  <text x="530" y="226" text-anchor="middle" font-size="7.8" fill="#880e4f">5 tasks, 4 cores → runs when any core frees, on EITHER executor</text>
+  <path d="M 290 163 C 330 180, 350 195, 376 208" fill="none" stroke="#ad1457"
+        stroke-width="1.6" stroke-dasharray="4,3" marker-end="url(#a4)"/>
+</svg>
+<p class="cap">5 partitions, 4 cores: four tasks run immediately, the fifth waits for a free slot.</p>
+
+<div class="why"><b>Waves.</b> Total tasks ÷ total cores = number of waves. 4,000 partitions on 200 cores is
+20 waves. This is why partition count matters: too few and cores sit idle; too many and per-task overhead
+(a few ms each) dominates. Target <b>2–4× your core count</b>, or roughly 128 MB of data per task.</div>
+
+<div class="iv"><b>Q: Does an executor split its data into tasks?</b> No — backwards. The <b>driver</b> creates
+one task per partition, then schedules those tasks onto free executor cores. A partition never contains
+multiple tasks within the same stage.</div>
+
+<!-- ============ 5 ============ -->
+<div class="step"></div>
+<h2><span class="n">5</span> Jobs, stages, DAG, and the shuffle boundary</h2>
+
+<svg viewBox="0 0 700 250" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial" font-size="9">
+  <defs><marker id="a5" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto">
+    <path d="M0,0 L0,6 L9,3 z" fill="#455a64"/></marker></defs>
+
+  <rect x="18" y="46" width="298" height="150" rx="7" fill="#f1f8e9" stroke="#558b2f" stroke-width="2"/>
+  <text x="167" y="66" text-anchor="middle" font-size="10.5" font-weight="bold" fill="#33691e">STAGE 1 — narrow, pipelined</text>
+  <text x="167" y="80" text-anchor="middle" font-size="7.8" fill="#666">all these fuse into ONE task per partition</text>
+
+  <rect x="40" y="92" width="60" height="26" rx="4" fill="#fff" stroke="#558b2f"/>
+  <text x="70" y="109" text-anchor="middle" font-size="8" fill="#33691e">scan</text>
+  <line x1="100" y1="105" x2="118" y2="105" stroke="#558b2f" stroke-width="1.6" marker-end="url(#a5)"/>
+  <rect x="120" y="92" width="60" height="26" rx="4" fill="#fff" stroke="#558b2f"/>
+  <text x="150" y="109" text-anchor="middle" font-size="8" fill="#33691e">filter</text>
+  <line x1="180" y1="105" x2="198" y2="105" stroke="#558b2f" stroke-width="1.6" marker-end="url(#a5)"/>
+  <rect x="200" y="92" width="60" height="26" rx="4" fill="#fff" stroke="#558b2f"/>
+  <text x="230" y="109" text-anchor="middle" font-size="8" fill="#33691e">select</text>
+
+  <rect x="40" y="132" width="220" height="48" rx="4" fill="#fff" stroke="#9e9d24" stroke-dasharray="3,2"/>
+  <text x="150" y="150" text-anchor="middle" font-size="8" fill="#827717">partial aggregate (map-side combine)</text>
+  <text x="150" y="166" text-anchor="middle" font-size="7.4" fill="#999">3M rows → a few partial rows per key</text>
+
+  <!-- shuffle -->
+  <rect x="326" y="60" width="60" height="122" rx="6" fill="#ffebee" stroke="#c62828" stroke-width="2.4"/>
+  <text x="356" y="102" text-anchor="middle" font-size="9.6" font-weight="bold" fill="#b71c1c">S</text>
+  <text x="356" y="116" text-anchor="middle" font-size="9.6" font-weight="bold" fill="#b71c1c">H</text>
+  <text x="356" y="130" text-anchor="middle" font-size="9.6" font-weight="bold" fill="#b71c1c">U</text>
+  <text x="356" y="144" text-anchor="middle" font-size="9.6" font-weight="bold" fill="#b71c1c">F</text>
+  <text x="356" y="158" text-anchor="middle" font-size="9.6" font-weight="bold" fill="#b71c1c">F</text>
+  <text x="356" y="80" text-anchor="middle" font-size="7.4" fill="#b71c1c">Exchange</text>
+  <line x1="316" y1="120" x2="322" y2="120" stroke="#455a64" stroke-width="2" marker-end="url(#a5)"/>
+  <line x1="386" y1="120" x2="394" y2="120" stroke="#455a64" stroke-width="2" marker-end="url(#a5)"/>
+
+  <rect x="396" y="46" width="286" height="150" rx="7" fill="#e3f2fd" stroke="#1565c0" stroke-width="2"/>
+  <text x="539" y="66" text-anchor="middle" font-size="10.5" font-weight="bold" fill="#0d47a1">STAGE 2 — after redistribution</text>
+  <text x="539" y="80" text-anchor="middle" font-size="7.8" fill="#666">NEW partitions, new tasks</text>
+
+  <rect x="418" y="92" width="76" height="26" rx="4" fill="#fff" stroke="#1565c0"/>
+  <text x="456" y="109" text-anchor="middle" font-size="8" fill="#0d47a1">final agg</text>
+  <line x1="494" y1="105" x2="512" y2="105" stroke="#1565c0" stroke-width="1.6" marker-end="url(#a5)"/>
+  <rect x="514" y="92" width="70" height="26" rx="4" fill="#fff" stroke="#1565c0"/>
+  <text x="549" y="109" text-anchor="middle" font-size="8" fill="#0d47a1">write</text>
+
+  <rect x="418" y="132" width="240" height="48" rx="4" fill="#fff" stroke="#90a4ae" stroke-dasharray="3,2"/>
+  <text x="538" y="150" text-anchor="middle" font-size="8" fill="#546e7a">stage 2 cannot start until stage 1 finishes</text>
+  <text x="538" y="166" text-anchor="middle" font-size="7.4" fill="#999">a shuffle is a synchronisation BARRIER</text>
+
+  <text x="350" y="220" text-anchor="middle" font-size="9" font-weight="bold" fill="#c62828">
+    A stage is not "the filter step". Stages are cut ONLY at shuffle boundaries.</text>
+  <text x="350" y="236" text-anchor="middle" font-size="8.4" fill="#666">
+    Count the Exchange nodes in explain() — that is your stage count minus one.</text>
+</svg>
+
+<h3>Narrow vs wide</h3>
+<table>
+<tr><th style="width:50%">Narrow</th><th>Wide</th></tr>
+<tr><td><code>filter</code> <code>select</code> <code>map</code> <code>withColumn</code></td>
+    <td><code>groupBy</code> <code>orderBy</code> <code>distinct</code> <code>repartition</code> most joins</td></tr>
+<tr><td>Output partition depends on limited input partitions</td>
+    <td>Output partition depends on data from <b>many</b> input partitions</td></tr>
+<tr><td>No network redistribution</td><td>Requires shuffle / Exchange</td></tr>
+<tr><td>Pipelines into the same stage</td><td>Creates a stage boundary</td></tr>
+</table>
+
+<div class="warn"><b>"Wide" means the dependency crosses partition boundaries.</b> It does not mean "many
+columns were selected". This misconception is common and immediately audible in an interview.</div>
+
+<h3>Why a shuffle is expensive — six separate costs</h3>
+<ol>
+<li><b>Serialization</b> — every record converted to bytes</li>
+<li><b>Disk</b> — map tasks write shuffle files locally; a full write plus a full read</li>
+<li><b>Network</b> — reduce tasks fetch from every map task (all-to-all)</li>
+<li><b>Memory</b> — sort/hash structures on both sides, spilling if they exceed execution memory</li>
+<li><b>Synchronisation</b> — a stage barrier; one straggler stalls everything</li>
+<li><b>Fault cost</b> — losing an executor loses its shuffle output, forcing upstream re-runs</li>
+</ol>
+
+<!-- ============ 6 ============ -->
+<div class="step"></div>
+<h2><span class="n">6</span> groupBy across executors</h2>
+<p class="small">This is the section that confuses people most. Follow the data for
+<code>df.groupBy("region").sum("amount")</code>.</p>
+
+<svg viewBox="0 0 700 330" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial" font-size="9">
+  <defs><marker id="a6" markerWidth="8" markerHeight="8" refX="7" refY="2.6" orient="auto">
+    <path d="M0,0 L0,5.2 L8,2.6 z" fill="#c62828"/></marker></defs>
+
+  <text x="18" y="22" font-size="10" font-weight="bold" fill="#33691e">PHASE A — each executor aggregates its OWN partitions locally (map-side combine)</text>
+
+  <g font-size="7.4">
+  <rect x="20" y="32" width="120" height="70" rx="5" fill="#f1f8e9" stroke="#558b2f" stroke-width="1.6"/>
+  <text x="80" y="48" text-anchor="middle" font-size="8.4" font-weight="bold" fill="#33691e">Executor 1</text>
+  <text x="80" y="63" text-anchor="middle" fill="#555">rows: TX, CA, TX, CA</text>
+  <rect x="32" y="70" width="96" height="24" rx="3" fill="#fff" stroke="#9e9d24"/>
+  <text x="80" y="80" text-anchor="middle" fill="#827717">partial: TX=90</text>
+  <text x="80" y="90" text-anchor="middle" fill="#827717">partial: CA=40</text>
+
+  <rect x="160" y="32" width="120" height="70" rx="5" fill="#f1f8e9" stroke="#558b2f" stroke-width="1.6"/>
+  <text x="220" y="48" text-anchor="middle" font-size="8.4" font-weight="bold" fill="#33691e">Executor 2</text>
+  <text x="220" y="63" text-anchor="middle" fill="#555">rows: TX, NY, NY</text>
+  <rect x="172" y="70" width="96" height="24" rx="3" fill="#fff" stroke="#9e9d24"/>
+  <text x="220" y="80" text-anchor="middle" fill="#827717">partial: TX=25</text>
+  <text x="220" y="90" text-anchor="middle" fill="#827717">partial: NY=70</text>
+
+  <rect x="300" y="32" width="120" height="70" rx="5" fill="#f1f8e9" stroke="#558b2f" stroke-width="1.6"/>
+  <text x="360" y="48" text-anchor="middle" font-size="8.4" font-weight="bold" fill="#33691e">Executor 3</text>
+  <text x="360" y="63" text-anchor="middle" fill="#555">rows: CA, TX, CA</text>
+  <rect x="312" y="70" width="96" height="24" rx="3" fill="#fff" stroke="#9e9d24"/>
+  <text x="360" y="80" text-anchor="middle" fill="#827717">partial: CA=55</text>
+  <text x="360" y="90" text-anchor="middle" fill="#827717">partial: TX=15</text>
+
+  <rect x="440" y="32" width="240" height="70" rx="5" fill="#fffde7" stroke="#f9a825" stroke-width="1.6"/>
+  <text x="560" y="52" text-anchor="middle" font-size="8.6" font-weight="bold" fill="#8a6d00">Why this matters</text>
+  <text x="560" y="68" text-anchor="middle" font-size="7.8" fill="#666">3 million rows collapse to a handful of</text>
+  <text x="560" y="80" text-anchor="middle" font-size="7.8" fill="#666">partial rows per key BEFORE the network.</text>
+  <text x="560" y="94" text-anchor="middle" font-size="7.8" font-weight="bold" fill="#8a6d00">This is why groupBy is affordable.</text>
+  </g>
+
+  <text x="18" y="128" font-size="10" font-weight="bold" fill="#c62828">PHASE B — SHUFFLE: partials routed by hash(region) % numShufflePartitions</text>
+
+  <line x1="80"  y1="102" x2="170" y2="176" stroke="#c62828" stroke-width="1.4" marker-end="url(#a6)"/>
+  <line x1="90"  y1="102" x2="330" y2="176" stroke="#c62828" stroke-width="1.4" marker-end="url(#a6)"/>
+  <line x1="215" y1="102" x2="180" y2="176" stroke="#c62828" stroke-width="1.4" marker-end="url(#a6)"/>
+  <line x1="225" y1="102" x2="490" y2="176" stroke="#c62828" stroke-width="1.4" marker-end="url(#a6)"/>
+  <line x1="355" y1="102" x2="340" y2="176" stroke="#c62828" stroke-width="1.4" marker-end="url(#a6)"/>
+  <line x1="365" y1="102" x2="196" y2="176" stroke="#c62828" stroke-width="1.4" marker-end="url(#a6)"/>
+
+  <text x="18" y="196" font-size="10" font-weight="bold" fill="#0d47a1">PHASE C — each region now lives in exactly ONE partition; final aggregate</text>
+
+  <g font-size="7.6">
+  <rect x="120" y="204" width="140" height="60" rx="5" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.8"/>
+  <text x="190" y="222" text-anchor="middle" font-size="8.4" font-weight="bold" fill="#0d47a1">Shuffle partition 0</text>
+  <text x="190" y="238" text-anchor="middle" fill="#555">ALL TX partials</text>
+  <text x="190" y="254" text-anchor="middle" font-weight="bold" fill="#0d47a1">TX = 90+25+15 = 130</text>
+
+  <rect x="280" y="204" width="140" height="60" rx="5" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.8"/>
+  <text x="350" y="222" text-anchor="middle" font-size="8.4" font-weight="bold" fill="#0d47a1">Shuffle partition 1</text>
+  <text x="350" y="238" text-anchor="middle" fill="#555">ALL CA partials</text>
+  <text x="350" y="254" text-anchor="middle" font-weight="bold" fill="#0d47a1">CA = 40+55 = 95</text>
+
+  <rect x="440" y="204" width="140" height="60" rx="5" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.8"/>
+  <text x="510" y="222" text-anchor="middle" font-size="8.4" font-weight="bold" fill="#0d47a1">Shuffle partition 2</text>
+  <text x="510" y="238" text-anchor="middle" fill="#555">ALL NY partials</text>
+  <text x="510" y="254" text-anchor="middle" font-weight="bold" fill="#0d47a1">NY = 70</text>
+  </g>
+
+  <rect x="18" y="280" width="664" height="42" rx="5" fill="#f8f9fa" stroke="#aaa" stroke-dasharray="4,3"/>
+  <text x="32" y="298" font-size="8.8" fill="#333">
+    ▸ <tspan font-weight="bold">The key insight:</tspan> the same region existed on MANY executors, so rows must be
+    redistributed so that one key ends up in one partition.</text>
+  <text x="32" y="313" font-size="8.8" fill="#333">
+    ▸ <tspan font-weight="bold">avg is decomposed into sum and count</tspan> precisely because that decomposition is
+    associative — which is what makes distributed averaging possible at all.</text>
+</svg>
+
+<div class="iv"><b>Q: Why is groupBy a wide transformation?</b> "Because the same key can exist in many input
+partitions. Spark computes partial aggregates locally, then redistributes those partials by key so that all
+values for a key land in one partition, where the final aggregate is computed."</div>
+
+<!-- ============ 7 ============ -->
+<div class="step"></div>
+<h2><span class="n">7</span> Delta table anatomy and <code>_delta_log</code></h2>
+
+<svg viewBox="0 0 700 290" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial" font-size="9">
+  <defs><marker id="a7" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto">
+    <path d="M0,0 L0,6 L9,3 z" fill="#c2410c"/></marker></defs>
+
+  <rect x="18" y="24" width="330" height="248" rx="8" fill="#fff8ee" stroke="#FF9900" stroke-width="2.4"/>
+  <text x="183" y="46" text-anchor="middle" font-size="11" font-weight="bold" fill="#8a5200">
+    s3://bucket/tables/customers/</text>
+
+  <rect x="34" y="60" width="298" height="86" rx="5" fill="#fff" stroke="#4a7fc9" stroke-width="1.6"/>
+  <text x="44" y="78" font-size="9" font-weight="bold" fill="#14508f">DATA — ordinary Parquet files</text>
+  <text x="44" y="94" font-size="7.8" font-family="monospace" fill="#555">part-00000-abc.snappy.parquet</text>
+  <text x="44" y="107" font-size="7.8" font-family="monospace" fill="#555">part-00001-def.snappy.parquet</text>
+  <text x="44" y="120" font-size="7.8" font-family="monospace" fill="#555">part-00002-ghi.snappy.parquet</text>
+  <text x="44" y="137" font-size="7.4" fill="#999">immutable · never edited in place</text>
+
+  <rect x="34" y="156" width="298" height="102" rx="5" fill="#fff5f0" stroke="#c2410c" stroke-width="2"/>
+  <text x="44" y="174" font-size="9" font-weight="bold" fill="#9a3412">_delta_log/ — the transaction log</text>
+  <text x="44" y="190" font-size="7.8" font-family="monospace" fill="#555">000...0000.json   ← version 0</text>
+  <text x="44" y="203" font-size="7.8" font-family="monospace" fill="#555">000...0001.json   ← version 1</text>
+  <text x="44" y="216" font-size="7.8" font-family="monospace" fill="#555">000...0002.json   ← version 2</text>
+  <text x="44" y="229" font-size="7.8" font-family="monospace" fill="#555">000...0010.checkpoint.parquet</text>
+  <text x="44" y="247" font-size="7.4" fill="#9a3412">each JSON = one atomic COMMIT</text>
+
+  <line x1="348" y1="150" x2="392" y2="150" stroke="#c2410c" stroke-width="2.2" marker-end="url(#a7)"/>
+
+  <rect x="396" y="24" width="288" height="248" rx="8" fill="#f8f9fa" stroke="#999" stroke-width="1.8"/>
+  <text x="540" y="46" text-anchor="middle" font-size="10.5" font-weight="bold" fill="#222">What a commit contains</text>
+
+  <rect x="410" y="58" width="260" height="70" rx="5" fill="#fff" stroke="#2e7d32" stroke-width="1.5"/>
+  <text x="420" y="76" font-size="8.6" font-weight="bold" fill="#1b5e20">ADD actions</text>
+  <text x="420" y="92" font-size="7.6" font-family="monospace" fill="#555">{"add": {"path": "part-002.parquet",</text>
+  <text x="420" y="104" font-size="7.6" font-family="monospace" fill="#555">  "size": 1048576, "stats": {...}}}</text>
+  <text x="420" y="120" font-size="7.4" fill="#666">stats = min/max per column → data skipping</text>
+
+  <rect x="410" y="136" width="260" height="56" rx="5" fill="#fff" stroke="#c62828" stroke-width="1.5"/>
+  <text x="420" y="154" font-size="8.6" font-weight="bold" fill="#b71c1c">REMOVE actions</text>
+  <text x="420" y="170" font-size="7.6" font-family="monospace" fill="#555">{"remove": {"path": "part-000.parquet"}}</text>
+  <text x="420" y="185" font-size="7.4" fill="#c62828">logically removed — file still on disk</text>
+
+  <rect x="410" y="200" width="260" height="58" rx="5" fill="#fff" stroke="#7e3ff2" stroke-width="1.5"/>
+  <text x="420" y="218" font-size="8.6" font-weight="bold" fill="#4c1d95">metaData / protocol / commitInfo</text>
+  <text x="420" y="234" font-size="7.6" fill="#555">schema · partition columns · writer id</text>
+  <text x="420" y="249" font-size="7.4" fill="#666">SNAPSHOT = replay all commits up to N</text>
+</svg>
+
+<div class="why"><b>The mental model.</b> Delta = Parquet + a folder of JSON commits. To read version N, Spark
+replays commits 0…N (or the latest checkpoint plus the remainder) to compute the <b>active file set</b>, then
+reads exactly those Parquet files. Nothing proprietary — delete <code>_delta_log</code> and you still have
+readable Parquet, you just lose ACID and history.</div>
+
+<div class="iv"><b>Q: Is <code>_delta_log</code> per row or per customer ID?</b> Neither. <b>It belongs to the
+whole table.</b> It records file-level actions, not row-level ones.</div>
+
+<h3>What the log buys you over plain Parquet</h3>
+<table>
+<tr><th style="width:46%">Plain Parquet folder</th><th>Delta table</th></tr>
+<tr><td>"The table" = whatever files are present</td><td>The log names exactly which files are current</td></tr>
+<tr><td>A failed write leaves half-written garbage visible</td><td>Commits are atomic — readers never see partial writes</td></tr>
+<tr><td>No UPDATE / DELETE / MERGE</td><td>Full DML support</td></tr>
+<tr><td>No history</td><td>Time travel by version or timestamp</td></tr>
+<tr><td>Schema drift silently corrupts</td><td>Schema enforced on write</td></tr>
+</table>
+
+<!-- ============ 8 ============ -->
+<div class="step"></div>
+<h2><span class="n">8</span> MERGE / upsert on immutable files</h2>
+
+<div class="warn"><b>The question everyone gets asked:</b> "Parquet files are immutable. So how does Delta
+update a single row?" Answer: <b>it doesn't</b>. It rewrites the file containing that row and commits a new
+version that points at the replacement.</div>
+
+<svg viewBox="0 0 700 300" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial" font-size="9">
+  <defs><marker id="a8" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto">
+    <path d="M0,0 L0,6 L9,3 z" fill="#455a64"/></marker></defs>
+
+  <text x="18" y="20" font-size="9.6" font-weight="bold" fill="#333">BEFORE — version 4</text>
+  <rect x="18" y="28" width="200" height="76" rx="5" fill="#fff" stroke="#4a7fc9" stroke-width="1.6"/>
+  <rect x="30" y="40" width="176" height="18" rx="2" fill="#e3f2fd" stroke="#1565c0"/>
+  <text x="118" y="53" text-anchor="middle" font-size="7.6" fill="#0d47a1">file-A.parquet  (C1, C2, C3)</text>
+  <rect x="30" y="62" width="176" height="18" rx="2" fill="#e3f2fd" stroke="#1565c0"/>
+  <text x="118" y="75" text-anchor="middle" font-size="7.6" fill="#0d47a1">file-B.parquet  (C4, C5)</text>
+  <text x="118" y="96" text-anchor="middle" font-size="7.2" fill="#888">active files: A, B</text>
+
+  <!-- merge box -->
+  <rect x="248" y="24" width="184" height="84" rx="6" fill="#fff3e0" stroke="#e65100" stroke-width="2"/>
+  <text x="340" y="44" text-anchor="middle" font-size="9.4" font-weight="bold" fill="#bf360c">MERGE INTO</text>
+  <text x="340" y="60" text-anchor="middle" font-size="7.6" fill="#555">update C2's address</text>
+  <text x="340" y="76" text-anchor="middle" font-size="7.6" fill="#555">1. find files containing C2</text>
+  <text x="340" y="90" text-anchor="middle" font-size="7.6" fill="#555">2. rewrite them with new values</text>
+  <text x="340" y="102" text-anchor="middle" font-size="7.6" fill="#555">3. commit add + remove</text>
+  <line x1="218" y1="66" x2="244" y2="66" stroke="#455a64" stroke-width="1.8" marker-end="url(#a8)"/>
+  <line x1="432" y1="66" x2="458" y2="66" stroke="#455a64" stroke-width="1.8" marker-end="url(#a8)"/>
+
+  <text x="462" y="20" font-size="9.6" font-weight="bold" fill="#333">AFTER — version 5</text>
+  <rect x="462" y="28" width="220" height="96" rx="5" fill="#fff" stroke="#4a7fc9" stroke-width="1.6"/>
+  <rect x="474" y="40" width="196" height="18" rx="2" fill="#ffebee" stroke="#c62828" stroke-dasharray="3,2"/>
+  <text x="572" y="53" text-anchor="middle" font-size="7.6" fill="#b71c1c">file-A.parquet  REMOVED</text>
+  <rect x="474" y="62" width="196" height="18" rx="2" fill="#e8f5e9" stroke="#2e7d32"/>
+  <text x="572" y="75" text-anchor="middle" font-size="7.6" fill="#1b5e20">file-C.parquet  ADDED (C1,C2*,C3)</text>
+  <rect x="474" y="84" width="196" height="18" rx="2" fill="#e3f2fd" stroke="#1565c0"/>
+  <text x="572" y="97" text-anchor="middle" font-size="7.6" fill="#0d47a1">file-B.parquet  untouched</text>
+  <text x="572" y="116" text-anchor="middle" font-size="7.2" fill="#888">active files: B, C  ·  A still on disk</text>
+
+  <!-- log -->
+  <rect x="18" y="136" width="664" height="66" rx="6" fill="#fff5f0" stroke="#c2410c" stroke-width="1.8"/>
+  <text x="32" y="156" font-size="9" font-weight="bold" fill="#9a3412">_delta_log/00000000000000000005.json</text>
+  <text x="32" y="174" font-size="7.8" font-family="monospace" fill="#555">
+    {"remove": {"path": "file-A.parquet", "deletionTimestamp": ...}}</text>
+  <text x="32" y="188" font-size="7.8" font-family="monospace" fill="#555">
+    {"add":    {"path": "file-C.parquet", "size": ..., "stats": {...}}}</text>
+
+  <rect x="18" y="214" width="664" height="72" rx="6" fill="#f8f9fa" stroke="#aaa" stroke-dasharray="4,3"/>
+  <text x="32" y="234" font-size="9" font-weight="bold" fill="#222">Consequences</text>
+  <text x="32" y="252" font-size="8.5" fill="#333">
+    ▸ <tspan font-weight="bold">Write amplification.</tspan> Updating one row rewrites a whole file. Good partitioning
+    and file sizing limit the blast radius.</text>
+  <text x="32" y="268" font-size="8.5" fill="#333">
+    ▸ <tspan font-weight="bold">"Remove" is logical, not physical.</tspan> file-A stays on disk until VACUUM — which is
+    exactly what makes time travel possible.</text>
+  <text x="32" y="282" font-size="8.5" fill="#333">
+    ▸ Readers on version 4 keep reading file-A safely while version 5 exists.</text>
+</svg>
+
+<pre>MERGE INTO customers AS t
+USING updates AS s
+  ON t.customer_id = s.customer_id
+WHEN MATCHED AND s.op = 'delete' THEN DELETE
+WHEN MATCHED THEN UPDATE SET *
+WHEN NOT MATCHED THEN INSERT *
+WHEN NOT MATCHED BY SOURCE THEN UPDATE SET t.is_active = false;</pre>
+
+<div class="why"><b>Performance rule.</b> MERGE cost is driven by <b>how many files must be rewritten</b>. Add a
+partition or Z-Order predicate on the join key so Delta can skip files it does not need to touch:
+<code>ON t.id = s.id AND t.event_date &gt;= current_date() - 7</code>.</div>
+
+<!-- ============ 9 ============ -->
+<div class="step"></div>
+<h2><span class="n">9</span> Time travel, SCD1 and SCD2</h2>
+
+<pre>SELECT * FROM customers VERSION AS OF 4;
+SELECT * FROM customers TIMESTAMP AS OF '2026-08-08 09:00:00';
+DESCRIBE HISTORY customers;
+RESTORE TABLE customers TO VERSION AS OF 4;</pre>
+
+<p>Time travel works because <code>remove</code> is logical. Delta computes the active file set for the
+requested version and reads those files — which still exist until <code>VACUUM</code> deletes them.</p>
+
+<div class="warn"><b>Time travel is bounded by VACUUM retention</b> (default 7 days). It is a <i>system</i>
+recovery feature, not a substitute for modelling business history.</div>
+
+<h3>Time travel vs SCD2 — the distinction interviewers probe</h3>
+<table>
+<tr><th style="width:20%"></th><th>Time travel</th><th>SCD Type 2</th></tr>
+<tr><td>Whose history</td><td><b>System</b> — the table as it was</td><td><b>Business</b> — the entity as it was</td></tr>
+<tr><td>Stored where</td><td>Old files + log</td><td>Extra <i>rows</i> in the current table</td></tr>
+<tr><td>Survives VACUUM</td><td>No</td><td>Yes</td></tr>
+<tr><td>Answers</td><td>"What did the table look like Tuesday?"</td><td>"What was this customer's tier in March?"</td></tr>
+</table>
+
+<svg viewBox="0 0 700 200" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial" font-size="9">
+  <text x="18" y="20" font-size="9.6" font-weight="bold" fill="#1b5e20">SCD TYPE 1 — overwrite, no history</text>
+  <rect x="18" y="28" width="320" height="56" rx="5" fill="#f1f8e9" stroke="#558b2f" stroke-width="1.6"/>
+  <text x="30" y="46" font-size="7.8" font-family="monospace" fill="#555">customer_id | city      | updated_at</text>
+  <line x1="30" y1="50" x2="326" y2="50" stroke="#ccc"/>
+  <text x="30" y="64" font-size="7.8" font-family="monospace" fill="#555">C2          | Boston    | 2026-08-10</text>
+  <text x="30" y="78" font-size="7.4" fill="#888">the old value (Austin) is simply gone</text>
+
+  <text x="362" y="20" font-size="9.6" font-weight="bold" fill="#0d47a1">SCD TYPE 2 — versioned rows</text>
+  <rect x="362" y="28" width="320" height="86" rx="5" fill="#e3f2fd" stroke="#1565c0" stroke-width="1.6"/>
+  <text x="374" y="46" font-size="7.4" font-family="monospace" fill="#555">id | city   | valid_from | valid_to   | current</text>
+  <line x1="374" y1="50" x2="670" y2="50" stroke="#ccc"/>
+  <text x="374" y="64" font-size="7.4" font-family="monospace" fill="#888">C2 | Austin | 2024-01-01 | 2026-08-10 | false</text>
+  <text x="374" y="78" font-size="7.4" font-family="monospace" fill="#0d47a1">C2 | Boston | 2026-08-10 | 9999-12-31 | true</text>
+  <text x="374" y="98" font-size="7.4" fill="#666">two rows, one entity — full business history</text>
+
+  <rect x="18" y="128" width="664" height="60" rx="5" fill="#f8f9fa" stroke="#aaa" stroke-dasharray="4,3"/>
+  <text x="32" y="148" font-size="8.8" fill="#333">
+    <tspan font-weight="bold">SCD2 implementation:</tspan> MERGE that (a) closes the current row —
+    set valid_to and current=false — and (b) inserts the new version.</text>
+  <text x="32" y="166" font-size="8.8" fill="#333">
+    Delta makes this safe because both operations land in <tspan font-weight="bold">one atomic commit</tspan>.
+    On plain Parquet you would risk a state with two current rows, or none.</text>
+  <text x="32" y="182" font-size="8.4" fill="#666">
+    Always query SCD2 tables with a filter: WHERE current = true (or a point-in-time BETWEEN predicate).</text>
+</svg>
+
+<!-- ============ 10 ============ -->
+<div class="step"></div>
+<h2><span class="n">10</span> Small files, OPTIMIZE, VACUUM, Z-Order</h2>
+
+<h3>Why small files hurt — four separate costs</h3>
+<table>
+<tr><td><b>1. Listing</b></td><td>The driver enumerates every file. On S3 this is paginated API calls and can take <b>minutes</b> with the cluster idle.</td></tr>
+<tr><td><b>2. Task overhead</b></td><td>One task per file — thousands each doing milliseconds of real work.</td></tr>
+<tr><td><b>3. Metadata</b></td><td>Every Parquet file has a footer. With tiny files the footer can exceed the data.</td></tr>
+<tr><td><b>4. Compression</b></td><td>Dictionary and RLE encodings need volume to be effective.</td></tr>
+</table>
+<p>Target <b>128 MB – 1 GB</b> per file. Also: every small file adds an <code>add</code> action to
+<code>_delta_log</code>, so the log itself grows and snapshot reconstruction slows.</p>
+
+<h3>The three maintenance commands</h3>
+<pre>OPTIMIZE customers;                                  -- compact small files
+OPTIMIZE customers ZORDER BY (customer_id, region);  -- compact + co-locate
+VACUUM customers RETAIN 168 HOURS;                   -- delete unreferenced files</pre>
+
+<table>
+<tr><th style="width:18%">Command</th><th>Does</th><th>Does NOT</th></tr>
+<tr><td><code>OPTIMIZE</code></td><td>Rewrites many small files into fewer big ones</td><td>Delete anything; old files remain for time travel</td></tr>
+<tr><td><code>ZORDER</code></td><td>Co-locates similar values so min/max stats become selective</td><td>Help columns you don't filter on</td></tr>
+<tr><td><code>VACUUM</code></td><td>Physically deletes files no longer referenced</td><td>Touch active files</td></tr>
+</table>
+
+<div class="warn"><b>VACUUM destroys time travel</b> beyond its retention window. Default and minimum safe
+retention is 7 days — it exists so that in-flight readers and writers are not pulled out from under. Lowering
+it requires explicitly disabling a safety check, and doing so during concurrent writes can corrupt readers.</div>
+
+<h3>Data skipping — how ZORDER actually helps</h3>
+<svg viewBox="0 0 700 150" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial" font-size="9">
+  <text x="18" y="18" font-size="9.4" font-weight="bold" fill="#c62828">WITHOUT Z-Order — ids scattered across files</text>
+  <g font-size="7.4">
+  <rect x="18" y="26" width="100" height="30" rx="3" fill="#ffebee" stroke="#c62828"/>
+  <text x="68" y="40" text-anchor="middle" fill="#b71c1c">file A</text><text x="68" y="51" text-anchor="middle" fill="#b71c1c">id 1–9999</text>
+  <rect x="126" y="26" width="100" height="30" rx="3" fill="#ffebee" stroke="#c62828"/>
+  <text x="176" y="40" text-anchor="middle" fill="#b71c1c">file B</text><text x="176" y="51" text-anchor="middle" fill="#b71c1c">id 2–9998</text>
+  <rect x="234" y="26" width="100" height="30" rx="3" fill="#ffebee" stroke="#c62828"/>
+  <text x="284" y="40" text-anchor="middle" fill="#b71c1c">file C</text><text x="284" y="51" text-anchor="middle" fill="#b71c1c">id 5–9997</text>
+  </g>
+  <text x="350" y="46" font-size="8.4" fill="#c62828">WHERE id = 42 → every file's min/max spans 42 → <tspan font-weight="bold">read ALL files</tspan></text>
+
+  <text x="18" y="84" font-size="9.4" font-weight="bold" fill="#1b5e20">WITH Z-Order — ids clustered</text>
+  <g font-size="7.4">
+  <rect x="18" y="92" width="100" height="30" rx="3" fill="#e8f5e9" stroke="#2e7d32" stroke-width="1.8"/>
+  <text x="68" y="106" text-anchor="middle" fill="#1b5e20">file A</text><text x="68" y="117" text-anchor="middle" font-weight="bold" fill="#1b5e20">id 1–3000</text>
+  <rect x="126" y="92" width="100" height="30" rx="3" fill="#f5f5f5" stroke="#bbb"/>
+  <text x="176" y="106" text-anchor="middle" fill="#999">file B</text><text x="176" y="117" text-anchor="middle" fill="#999">id 3001–6000</text>
+  <rect x="234" y="92" width="100" height="30" rx="3" fill="#f5f5f5" stroke="#bbb"/>
+  <text x="284" y="106" text-anchor="middle" fill="#999">file C</text><text x="284" y="117" text-anchor="middle" fill="#999">id 6001–9999</text>
+  </g>
+  <text x="350" y="112" font-size="8.4" fill="#1b5e20">WHERE id = 42 → only file A can match → <tspan font-weight="bold">skip B and C</tspan></text>
+
+  <text x="18" y="144" font-size="8.2" fill="#666">
+    The min/max stats live in _delta_log. Z-Order does not create an index — it makes the existing stats selective.</text>
+</svg>
+
+<p><b>Liquid clustering</b> is the newer alternative: <code>CLUSTER BY (col)</code> at table creation. Unlike
+Z-Order it can be changed later without rewriting the whole table, and it handles skew better.</p>
+
+<!-- ============ 11 ============ -->
+<div class="step"></div>
+<h2><span class="n">11</span> Joins, skew, and AQE</h2>
+
+<svg viewBox="0 0 700 230" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial" font-size="9">
+  <defs><marker id="a9" markerWidth="8" markerHeight="8" refX="7" refY="2.6" orient="auto">
+    <path d="M0,0 L0,5.2 L8,2.6 z" fill="#2e7d32"/></marker>
+    <marker id="a9r" markerWidth="8" markerHeight="8" refX="7" refY="2.6" orient="auto">
+    <path d="M0,0 L0,5.2 L8,2.6 z" fill="#c62828"/></marker></defs>
+
+  <text x="18" y="18" font-size="9.6" font-weight="bold" fill="#1b5e20">BROADCAST HASH JOIN — small side copied everywhere, big side never moves</text>
+  <rect x="18" y="26" width="90" height="40" rx="5" fill="#e8f5e9" stroke="#2e7d32" stroke-width="1.8"/>
+  <text x="63" y="42" text-anchor="middle" font-size="8" font-weight="bold" fill="#1b5e20">dim table</text>
+  <text x="63" y="56" text-anchor="middle" font-size="7.4" fill="#666">5 MB</text>
+  <g font-size="7.4">
+  <rect x="200" y="20" width="140" height="26" rx="3" fill="#f1f8e9" stroke="#558b2f"/>
+  <text x="270" y="37" text-anchor="middle" fill="#33691e">Exec 1: fact partition + dim copy</text>
+  <rect x="200" y="50" width="140" height="26" rx="3" fill="#f1f8e9" stroke="#558b2f"/>
+  <text x="270" y="67" text-anchor="middle" fill="#33691e">Exec 2: fact partition + dim copy</text>
+  <rect x="200" y="80" width="140" height="26" rx="3" fill="#f1f8e9" stroke="#558b2f"/>
+  <text x="270" y="97" text-anchor="middle" fill="#33691e">Exec 3: fact partition + dim copy</text>
+  </g>
+  <line x1="108" y1="40" x2="196" y2="33" stroke="#2e7d32" stroke-width="1.5" marker-end="url(#a9)"/>
+  <line x1="108" y1="46" x2="196" y2="63" stroke="#2e7d32" stroke-width="1.5" marker-end="url(#a9)"/>
+  <line x1="108" y1="52" x2="196" y2="93" stroke="#2e7d32" stroke-width="1.5" marker-end="url(#a9)"/>
+  <text x="360" y="50" font-size="8.2" fill="#1b5e20">no shuffle on the</text>
+  <text x="360" y="63" font-size="8.2" font-weight="bold" fill="#1b5e20">large side at all</text>
+
+  <text x="18" y="130" font-size="9.6" font-weight="bold" fill="#c62828">SKEW — one hot key makes one shuffle partition enormous</text>
+  <g font-size="7.4">
+  <rect x="18"  y="140" width="46" height="16" rx="2" fill="#e3f2fd" stroke="#1565c0"/><text x="41" y="151" text-anchor="middle" fill="#0d47a1">P0 20s</text>
+  <rect x="70"  y="140" width="46" height="16" rx="2" fill="#e3f2fd" stroke="#1565c0"/><text x="93" y="151" text-anchor="middle" fill="#0d47a1">P1 21s</text>
+  <rect x="122" y="140" width="46" height="16" rx="2" fill="#e3f2fd" stroke="#1565c0"/><text x="145" y="151" text-anchor="middle" fill="#0d47a1">P2 19s</text>
+  <rect x="174" y="140" width="200" height="16" rx="2" fill="#ffcdd2" stroke="#c62828" stroke-width="1.8"/>
+  <text x="274" y="151" text-anchor="middle" font-weight="bold" fill="#b71c1c">P3 — 45 MINUTES (hot key)</text>
+  <rect x="380" y="140" width="46" height="16" rx="2" fill="#e3f2fd" stroke="#1565c0"/><text x="403" y="151" text-anchor="middle" fill="#0d47a1">P4 20s</text>
+  </g>
+  <text x="18" y="176" font-size="8.4" fill="#c62828">
+    ▸ The stage cannot finish until P3 finishes. <tspan font-weight="bold">Adding executors does not split P3.</tspan></text>
+  <text x="18" y="192" font-size="8.4" fill="#333">
+    ▸ Diagnose: Stages tab → Summary Metrics → compare <tspan font-weight="bold">max vs median</tspan> task duration. &gt;10× = skew.</text>
+  <text x="18" y="208" font-size="8.4" fill="#333">
+    ▸ Fix: AQE skew join → salt the hot key → broadcast the small side to avoid the shuffle entirely.</text>
+  <text x="18" y="224" font-size="8.4" fill="#666">
+    ▸ AQE skew handling covers <tspan font-style="italic">joins only</tspan> — not skewed groupBy, windows, or UDF-induced skew.</text>
+</svg>
+
+<h3>The three strategies</h3>
+<table>
+<tr><th style="width:24%">Strategy</th><th>Mechanism</th><th>Cost</th></tr>
+<tr><td><b>Broadcast hash</b></td><td>Small side collected to driver, shipped to all executors, big side streams locally</td><td>No shuffle on the big side. Needs driver + executor memory for the copy.</td></tr>
+<tr><td><b>Sort-merge</b></td><td>Both sides shuffled by key, sorted within partitions, merged</td><td>2 shuffles + 2 sorts. Scales to any size.</td></tr>
+<tr><td><b>Shuffle hash</b></td><td>Both shuffled; hash table built per post-shuffle partition</td><td>Shuffle, no sort.</td></tr>
+</table>
+
+<div class="warn"><b>Broadcast passes through the driver.</b> A 2 GB broadcast needs 2 GB of <i>driver</i> heap
+<i>plus</i> 2 GB on every executor. Broadcasts cause driver OOM, not only executor OOM. And
+<code>broadcast()</code> is a <b>hint</b> — Spark ignores it for FULL OUTER joins. Always verify
+<code>BroadcastHashJoin</code> in the plan.</div>
+
+<h3>AQE — what it changes at runtime</h3>
+<table>
+<tr><td><b>Coalesce shuffle partitions</b></td><td>Merges tiny post-shuffle partitions after seeing real sizes. This is what makes the default 200 survivable.</td></tr>
+<tr><td><b>Switch join strategy</b></td><td>Flips sort-merge → broadcast when a side turns out small after runtime filtering.</td></tr>
+<tr><td><b>Split skewed partitions</b></td><td>Splits an oversized partition and replicates the matching side. Requires exceeding <b>both</b> the factor and the byte threshold.</td></tr>
+</table>
+
+<div class="why"><b>Why AQE can exist at all:</b> a shuffle already forces a materialisation barrier. The same
+property that makes shuffle expensive is what gives Spark a moment to look at real statistics and re-plan. Cost
+and opportunity are the same mechanism.</div>
+
+<!-- ============ 12 ============ -->
+<div class="step"></div>
+<h2><span class="n">12</span> Medallion architecture</h2>
+
+<svg viewBox="0 0 700 250" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial" font-size="9">
+  <defs><marker id="a10" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto">
+    <path d="M0,0 L0,6 L9,3 z" fill="#455a64"/></marker></defs>
+
+  <rect x="14" y="60" width="92" height="70" rx="6" fill="#eceff1" stroke="#607d8b" stroke-width="1.8"/>
+  <text x="60" y="82" text-anchor="middle" font-size="9" font-weight="bold" fill="#37474f">SOURCES</text>
+  <text x="60" y="98" text-anchor="middle" font-size="7.4" fill="#555">S3 · Kafka</text>
+  <text x="60" y="112" text-anchor="middle" font-size="7.4" fill="#555">databases</text>
+  <line x1="106" y1="95" x2="132" y2="95" stroke="#455a64" stroke-width="2" marker-end="url(#a10)"/>
+
+  <rect x="134" y="46" width="140" height="98" rx="6" fill="#fff3e0" stroke="#a1622a" stroke-width="2.2"/>
+  <text x="204" y="68" text-anchor="middle" font-size="10.5" font-weight="bold" fill="#7a3c00">BRONZE</text>
+  <text x="204" y="86" text-anchor="middle" font-size="7.6" fill="#555">raw · append-only</text>
+  <text x="204" y="100" text-anchor="middle" font-size="7.6" fill="#555">source fidelity kept</text>
+  <text x="204" y="114" text-anchor="middle" font-size="7.6" fill="#555">+ ingest metadata</text>
+  <text x="204" y="132" text-anchor="middle" font-size="7.4" font-weight="bold" fill="#7a3c00">REPLAYABLE</text>
+  <line x1="274" y1="95" x2="300" y2="95" stroke="#455a64" stroke-width="2" marker-end="url(#a10)"/>
+
+  <rect x="302" y="46" width="140" height="98" rx="6" fill="#eceff1" stroke="#78909c" stroke-width="2.2"/>
+  <text x="372" y="68" text-anchor="middle" font-size="10.5" font-weight="bold" fill="#37474f">SILVER</text>
+  <text x="372" y="86" text-anchor="middle" font-size="7.6" fill="#555">parsed · validated</text>
+  <text x="372" y="100" text-anchor="middle" font-size="7.6" fill="#555">deduplicated · enriched</text>
+  <text x="372" y="114" text-anchor="middle" font-size="7.6" fill="#555">conformed types</text>
+  <text x="372" y="132" text-anchor="middle" font-size="7.4" font-weight="bold" fill="#37474f">ONE OWNER OF LOGIC</text>
+  <line x1="442" y1="95" x2="468" y2="95" stroke="#455a64" stroke-width="2" marker-end="url(#a10)"/>
+
+  <rect x="470" y="46" width="140" height="98" rx="6" fill="#fff8e1" stroke="#c9a227" stroke-width="2.2"/>
+  <text x="540" y="68" text-anchor="middle" font-size="10.5" font-weight="bold" fill="#7a5c10">GOLD</text>
+  <text x="540" y="86" text-anchor="middle" font-size="7.6" fill="#555">business aggregates</text>
+  <text x="540" y="100" text-anchor="middle" font-size="7.6" fill="#555">dimensional models</text>
+  <text x="540" y="114" text-anchor="middle" font-size="7.6" fill="#555">serving-ready</text>
+  <text x="540" y="132" text-anchor="middle" font-size="7.4" font-weight="bold" fill="#7a5c10">SMALL &amp; FAST</text>
+
+  <g font-size="7.6">
+  <rect x="622" y="42" width="66" height="28" rx="4" fill="#f8f9fa" stroke="#888"/>
+  <text x="655" y="60" text-anchor="middle" fill="#333">BI / SQL</text>
+  <rect x="622" y="76" width="66" height="28" rx="4" fill="#f8f9fa" stroke="#888"/>
+  <text x="655" y="94" text-anchor="middle" fill="#333">ML feats</text>
+  <rect x="622" y="110" width="66" height="28" rx="4" fill="#f8f9fa" stroke="#888"/>
+  <text x="655" y="128" text-anchor="middle" fill="#333">APIs</text>
+  </g>
+  <line x1="610" y1="80" x2="618" y2="60"  stroke="#455a64" stroke-width="1.4" marker-end="url(#a10)"/>
+  <line x1="610" y1="95" x2="618" y2="92"  stroke="#455a64" stroke-width="1.4" marker-end="url(#a10)"/>
+  <line x1="610" y1="110" x2="618" y2="124" stroke="#455a64" stroke-width="1.4" marker-end="url(#a10)"/>
+
+  <rect x="14" y="164" width="674" height="76" rx="6" fill="#f8f9fa" stroke="#aaa" stroke-dasharray="4,3"/>
+  <text x="30" y="184" font-size="9.4" font-weight="bold" fill="#222">These are quality/responsibility layers — not merely three folders</text>
+  <text x="30" y="202" font-size="8.5" fill="#333">
+    ▸ <tspan font-weight="bold">Bronze</tspan> keeps raw fidelity so you can reprocess after fixing a bug in Silver logic.
+    Never put business logic here.</text>
+  <text x="30" y="218" font-size="8.5" fill="#333">
+    ▸ <tspan font-weight="bold">Silver</tspan> is where ALL conforming logic lives — in ONE place. Two systems computing
+    the same metric independently will diverge.</text>
+  <text x="30" y="234" font-size="8.5" fill="#333">
+    ▸ <tspan font-weight="bold">Gold</tspan> is derived and disposable. If you can rebuild it from Silver, you can afford
+    to change it.</text>
+</svg>
+
+<!-- ============ 13 ============ -->
+<div class="step"></div>
+<h2><span class="n">13</span> Auto Loader, streaming, checkpoints</h2>
+
+<svg viewBox="0 0 700 190" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial" font-size="9">
+  <defs><marker id="a11" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto">
+    <path d="M0,0 L0,6 L9,3 z" fill="#455a64"/></marker></defs>
+
+  <rect x="14" y="30" width="104" height="40" rx="5" fill="#fff8ee" stroke="#FF9900" stroke-width="1.8"/>
+  <text x="66" y="47" text-anchor="middle" font-size="8.6" font-weight="bold" fill="#8a5200">S3 arriving files</text>
+  <text x="66" y="61" text-anchor="middle" font-size="7.4" fill="#666">continuously</text>
+  <rect x="14" y="82" width="104" height="40" rx="5" fill="#f3e5f5" stroke="#6a1b9a" stroke-width="1.8"/>
+  <text x="66" y="99" text-anchor="middle" font-size="8.6" font-weight="bold" fill="#4a148c">Kafka</text>
+  <text x="66" y="113" text-anchor="middle" font-size="7.4" fill="#666">offsets</text>
+
+  <line x1="118" y1="50" x2="164" y2="66" stroke="#455a64" stroke-width="1.8" marker-end="url(#a11)"/>
+  <line x1="118" y1="102" x2="164" y2="86" stroke="#455a64" stroke-width="1.8" marker-end="url(#a11)"/>
+
+  <rect x="166" y="46" width="140" height="60" rx="6" fill="#e3f2fd" stroke="#1565c0" stroke-width="2"/>
+  <text x="236" y="66" text-anchor="middle" font-size="9.4" font-weight="bold" fill="#0d47a1">Auto Loader /</text>
+  <text x="236" y="80" text-anchor="middle" font-size="9.4" font-weight="bold" fill="#0d47a1">Structured Streaming</text>
+  <text x="236" y="96" text-anchor="middle" font-size="7.4" fill="#666">incremental micro-batches</text>
+
+  <line x1="306" y1="76" x2="352" y2="76" stroke="#455a64" stroke-width="1.8" marker-end="url(#a11)"/>
+
+  <rect x="354" y="46" width="130" height="60" rx="6" fill="#fff3e0" stroke="#a1622a" stroke-width="2"/>
+  <text x="419" y="72" text-anchor="middle" font-size="9.6" font-weight="bold" fill="#7a3c00">Bronze Delta</text>
+  <text x="419" y="90" text-anchor="middle" font-size="7.4" fill="#666">exactly-once file handling</text>
+
+  <rect x="166" y="126" width="318" height="46" rx="6" fill="#fff5f0" stroke="#c2410c" stroke-width="2"/>
+  <text x="325" y="146" text-anchor="middle" font-size="9.4" font-weight="bold" fill="#9a3412">CHECKPOINT</text>
+  <text x="325" y="163" text-anchor="middle" font-size="7.6" fill="#9a3412">
+    which files/offsets are done · stateful operator state · query plan version</text>
+  <line x1="236" y1="106" x2="236" y2="122" stroke="#c2410c" stroke-width="1.8" marker-end="url(#a11)"/>
+  <line x1="419" y1="106" x2="419" y2="122" stroke="#c2410c" stroke-width="1.8" marker-end="url(#a11)"/>
+
+  <rect x="500" y="46" width="186" height="126" rx="6" fill="#f8f9fa" stroke="#aaa"/>
+  <text x="512" y="66" font-size="8.8" font-weight="bold" fill="#222">Non-negotiables</text>
+  <text x="512" y="84" font-size="7.8" fill="#333">▸ Schema is <tspan font-weight="bold">mandatory</tspan></text>
+  <text x="512" y="100" font-size="7.8" fill="#333">▸ Rate-limit or a backlog OOMs you</text>
+  <text x="512" y="112" font-size="7.4" fill="#666">   maxFilesPerTrigger / maxOffsetsPerTrigger</text>
+  <text x="512" y="128" font-size="7.8" fill="#333">▸ Watermark bounds state growth</text>
+  <text x="512" y="144" font-size="7.8" fill="#333">▸ Delete the checkpoint = full reprocess</text>
+  <text x="512" y="162" font-size="7.8" fill="#c62828">▸ Two queries, one checkpoint = corrupt</text>
+</svg>
+
+<pre>(spark.readStream.format("cloudFiles")
+   .option("cloudFiles.format", "parquet")
+   .option("cloudFiles.schemaLocation", f"{path}/_schema")
+   .option("cloudFiles.schemaEvolutionMode", "addNewColumns")
+   .load(raw_path)
+   .withColumn("_ingest_ts", F.current_timestamp())
+   .withColumn("_source_file", F.col("_metadata.file_path"))
+ .writeStream
+   .option("checkpointLocation", f"{path}/_ckpt")
+   .trigger(availableNow=True)        # process all available, then STOP
+   .toTable("bronze_events"))</pre>
+
+<div class="why"><b><code>trigger(availableNow=True)</code> is the underused one.</b> You get streaming
+semantics — checkpointed, exactly-once file handling — with batch execution. Use it instead of a scheduled
+batch job whenever the source is an append-only directory. Re-running processes only new files.</div>
+
+<div class="iv"><b>Q: Does Spark give exactly-once?</b> "Exactly-once <i>processing</i> internally, via
+checkpointed offsets and deterministic replay. <b>End-to-end</b> additionally needs a replayable source and an
+idempotent or transactional sink. The standard hook is <code>foreachBatch</code> with the
+<code>batchId</code> — a MERGE keyed on it makes retries safe. Writing to a REST API is at-least-once no
+matter what Spark does."</div>
+
+<h3>Watermarks</h3>
+<pre>.withWatermark("event_time", "10 minutes")
+.groupBy(F.window("event_time", "1 hour"), "device_id").agg(...)</pre>
+<p>Two effects: it bounds how long window <b>state</b> is retained, and in append mode it decides when a window
+is emitted. <b>Too long → unbounded state → the job OOMs after days.</b> Too short → late data silently
+dropped. Monitor <code>numRowsTotal</code> in <code>stateOperators</code>; monotonic growth predicts a failure
+weeks in advance.</p>
+
+<!-- ============ 14 ============ -->
+<div class="step"></div>
+<h2><span class="n">14</span> Debugging: a 20-minute job now takes 2 hours</h2>
+
+<div class="why"><b>Follow this order. Reversing it is what a weak engineer does.</b></div>
+
+<ol>
+<li><b>Compare inputs.</b> Input bytes and file count versus a known-good run. Did the source triple? Did
+someone start writing 400,000 tiny files?</li>
+<li><b>Find the slow stage.</b> Jobs → Stages. Where is wall-clock time actually spent?</li>
+<li><b>Read the physical plan.</b> Did a broadcast join silently become a sort-merge join because the "small"
+side grew past the threshold? This is the single most common cause of a sudden regression.</li>
+<li><b>Task duration distribution.</b> Summary Metrics → one 45-minute task among 999 twenty-second tasks is
+<b>classic skew</b>.</li>
+<li><b>Shuffle read/write and spill.</b> Heavy disk spill means partitions too large for execution memory.</li>
+<li><b>Compare shuffle bytes to input bytes.</b> Shuffle much larger than input means something exploded rows —
+an <code>explode</code>, or duplicate keys on both sides of a join causing many-to-many expansion.</li>
+<li><b>GC time and executor memory.</b> &gt;20% GC means memory pressure, excessive caching, or too-wide rows.</li>
+<li><b>Only now</b> consider more resources.</li>
+</ol>
+
+<h3>Symptom → cause → fix</h3>
+<table>
+<tr><th style="width:24%">Symptom</th><th style="width:34%">Likely cause</th><th>Fix, in order</th></tr>
+<tr><td>One task 50× slower</td><td>Data skew on the shuffle key</td><td>AQE skew join → salt hot keys → broadcast to avoid the shuffle</td></tr>
+<tr><td>Driver OOM</td><td><code>collect()</code>; huge broadcast; enormous plan</td><td>Write instead of collect; check broadcast sizes; collapse <code>withColumn</code> loops</td></tr>
+<tr><td>Executor OOM</td><td>Skewed partition; oversized broadcast; too few partitions</td><td>Fix skew → raise shuffle partitions → lower broadcast threshold → memory last</td></tr>
+<tr><td>Container killed, no JVM OOM</td><td>Python worker / native memory outside the heap</td><td>Raise <code>memoryOverhead</code>; shrink Arrow batch; drop the Pandas UDF</td></tr>
+<tr><td>Slow but cluster idle</td><td>Driver-side work: file listing, plan generation</td><td>Compact small files; explicit schemas; avoid huge globs</td></tr>
+<tr><td>Adding executors doesn't help</td><td>Too few partitions; skew; driver bottleneck; external I/O limit</td><td>Check task count vs cores; find the straggler</td></tr>
+<tr><td>Got slower after adding a column</td><td>New <code>countDistinct</code>, UDF, or <code>explode</code></td><td>Diff the plans; look for <code>Expand</code> / <code>BatchEvalPython</code></td></tr>
+</table>
+
+<h3>Tuning order</h3>
+<table>
+<tr><td>1</td><td><b>Reduce data</b></td><td>Filter early, select only needed columns, exploit partition pruning</td></tr>
+<tr><td>2</td><td><b>Fix the plan</b></td><td>Broadcast genuinely small dimensions; remove gratuitous repartitions</td></tr>
+<tr><td>3</td><td><b>Fix skew</b></td><td>AQE, then salting</td></tr>
+<tr><td>4</td><td><b>Fix file layout</b></td><td>OPTIMIZE, Z-Order, sensible output partitioning</td></tr>
+<tr><td>5</td><td><b>Size partitions</b></td><td><code>shuffle.partitions</code> for ~128 MB per task</td></tr>
+<tr><td>6</td><td><b>Then</b> add resources</td><td>Only after evidence from 1–5</td></tr>
+</table>
+
+<!-- ============ 15 ============ -->
+<div class="step"></div>
+<h2><span class="n">15</span> Twenty questions with model answers</h2>
+
+<table>
+<tr><th style="width:34%">Question</th><th>Answer</th></tr>
+<tr><td><b>1.</b> Partitions vs tasks?</td><td>Within a stage, one task per partition. That task runs on one executor core.</td></tr>
+<tr><td><b>2.</b> Are partitions tied to executors?</td><td>No. The scheduler can run a partition's task on any suitable free executor.</td></tr>
+<tr><td><b>3.</b> When does Spark create stages?</td><td>When an action triggers execution, the physical plan is split into stages at shuffle boundaries.</td></tr>
+<tr><td><b>4.</b> Is <code>filter</code> a stage?</td><td>No. Scan, filter, select and other narrow operations pipeline into one stage.</td></tr>
+<tr><td><b>5.</b> Why is <code>groupBy</code> wide?</td><td>The same key exists in many partitions, so partial aggregates must be redistributed by key.</td></tr>
+<tr><td><b>6.</b> Does every executor get the whole 1 TB?</td><td>No. Each executor reads only the byte ranges for its assigned tasks.</td></tr>
+<tr><td><b>7.</b> What happens after a shuffle?</td><td>A new set of shuffle partitions exists; the next stage creates tasks that read them.</td></tr>
+<tr><td><b>8.</b> What is the Delta log?</td><td>Table-level transaction metadata recording files added and removed, supporting versioned snapshots.</td></tr>
+<tr><td><b>9.</b> Is the Delta log per customer ID?</td><td>No — it belongs to the whole table and is file-level, not row-level.</td></tr>
+<tr><td><b>10.</b> How does MERGE update an immutable file?</td><td>It rewrites the affected files and commits <code>add</code>/<code>remove</code> actions so the new snapshot points at the replacements.</td></tr>
+<tr><td><b>11.</b> What does <code>remove</code> mean?</td><td>Logically removed from the current snapshot. The file stays on disk until VACUUM — which is what enables time travel.</td></tr>
+<tr><td><b>12.</b> How does time travel work?</td><td>Delta computes the active file set for the requested version/timestamp and reads those files.</td></tr>
+<tr><td><b>13.</b> Time travel vs SCD2?</td><td>Time travel is <i>system</i> history (table snapshots, bounded by VACUUM). SCD2 is <i>business</i> history stored as rows.</td></tr>
+<tr><td><b>14.</b> Optimistic concurrency?</td><td>Writers proceed optimistically, then validate at commit. Conflicting stale changes are detected and the write fails rather than silently losing data.</td></tr>
+<tr><td><b>15.</b> OPTIMIZE vs VACUUM?</td><td>OPTIMIZE compacts file layout. VACUUM physically deletes unreferenced files after retention.</td></tr>
+<tr><td><b>16.</b> What causes skew?</td><td>A few keys dominate, creating oversized shuffle partitions and straggler tasks.</td></tr>
+<tr><td><b>17.</b> Broadcast vs sort-merge?</td><td>Broadcast ships a small side to all executors, avoiding a shuffle on the large side. Sort-merge shuffles and sorts both sides by key.</td></tr>
+<tr><td><b>18.</b> What is AQE?</td><td>Runtime re-optimisation using real shuffle statistics: coalesce partitions, switch join strategy, split skewed partitions.</td></tr>
+<tr><td><b>19.</b> Job suddenly 6× slower?</td><td>Compare inputs → find the slow stage → read the plan (did a broadcast stop happening?) → check skew/spill/GC → fix the root cause.</td></tr>
+<tr><td><b>20.</b> Explain Spark in one minute.</td><td>See the memory sheet on the next page.</td></tr>
+</table>
+
+<div class="iv"><b>Whiteboard scenario — "design a production pipeline."</b> Sources land in Bronze via Auto
+Loader with checkpoints and ingest metadata. Silver holds all conforming logic in one place — validation,
+dedup, type conformance — written with MERGE for idempotency. Gold holds business aggregates, small and
+rebuildable. Unity Catalog governs access and provides lineage. Workflows orchestrate with task dependencies
+and failure alerts. Every stage is idempotent so a re-run is safe. Maintenance runs OPTIMIZE and VACUUM on a
+schedule. Monitoring watches input volume, task skew, and job duration trends — not just success/failure.</div>
+
+<!-- ============ 16 ============ -->
+<div class="step"></div>
+<h2><span class="n">16</span> One-page memory sheet</h2>
+
+<svg viewBox="0 0 700 170" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial" font-size="9">
+  <defs><marker id="a12" markerWidth="8" markerHeight="8" refX="7" refY="2.6" orient="auto">
+    <path d="M0,0 L0,5.2 L8,2.6 z" fill="#455a64"/></marker></defs>
+  <text x="18" y="20" font-size="10" font-weight="bold" fill="#222">SPARK EXECUTION</text>
+  <g font-size="7.8">
+  <rect x="14"  y="30" width="70" height="30" rx="4" fill="#eceff1" stroke="#607d8b"/><text x="49" y="49" text-anchor="middle" fill="#37474f">Submit</text>
+  <rect x="98"  y="30" width="70" height="30" rx="4" fill="#e3f2fd" stroke="#1565c0"/><text x="133" y="49" text-anchor="middle" fill="#0d47a1">Driver</text>
+  <rect x="182" y="30" width="70" height="30" rx="4" fill="#f3e5f5" stroke="#6a1b9a"/><text x="217" y="49" text-anchor="middle" fill="#4a148c">Partitions</text>
+  <rect x="266" y="30" width="70" height="30" rx="4" fill="#ede7f6" stroke="#5e35b1"/><text x="301" y="49" text-anchor="middle" fill="#311b92">Tasks</text>
+  <rect x="350" y="30" width="70" height="30" rx="4" fill="#e8f5e9" stroke="#2e7d32"/><text x="385" y="49" text-anchor="middle" fill="#1b5e20">Cores</text>
+  <rect x="434" y="30" width="70" height="30" rx="4" fill="#ffebee" stroke="#c62828"/><text x="469" y="49" text-anchor="middle" fill="#b71c1c">Shuffle</text>
+  <rect x="518" y="30" width="80" height="30" rx="4" fill="#f3e5f5" stroke="#6a1b9a"/><text x="558" y="49" text-anchor="middle" fill="#4a148c">New partitions</text>
+  <rect x="612" y="30" width="74" height="30" rx="4" fill="#fff8ee" stroke="#FF9900"/><text x="649" y="49" text-anchor="middle" fill="#8a5200">Write</text>
+  </g>
+  <g stroke="#455a64" stroke-width="1.4" marker-end="url(#a12)">
+  <line x1="84" y1="45" x2="94" y2="45"/><line x1="168" y1="45" x2="178" y2="45"/>
+  <line x1="252" y1="45" x2="262" y2="45"/><line x1="336" y1="45" x2="346" y2="45"/>
+  <line x1="420" y1="45" x2="430" y2="45"/><line x1="504" y1="45" x2="514" y2="45"/>
+  <line x1="598" y1="45" x2="608" y2="45"/></g>
+  <text x="133" y="72" text-anchor="middle" font-size="6.8" fill="#666">plans</text>
+  <text x="301" y="72" text-anchor="middle" font-size="6.8" fill="#666">1 per partition</text>
+  <text x="469" y="72" text-anchor="middle" font-size="6.8" fill="#666">wide op</text>
+
+  <text x="18" y="100" font-size="10" font-weight="bold" fill="#222">DELTA LAKE</text>
+  <g font-size="7.8">
+  <rect x="14"  y="110" width="82" height="30" rx="4" fill="#e8f5e9" stroke="#2e7d32"/><text x="55" y="129" text-anchor="middle" fill="#1b5e20">Spark write</text>
+  <rect x="110" y="110" width="82" height="30" rx="4" fill="#e3f2fd" stroke="#1565c0"/><text x="151" y="129" text-anchor="middle" fill="#0d47a1">Parquet files</text>
+  <rect x="206" y="110" width="82" height="30" rx="4" fill="#fff5f0" stroke="#c2410c"/><text x="247" y="129" text-anchor="middle" fill="#9a3412">_delta_log</text>
+  <rect x="302" y="110" width="82" height="30" rx="4" fill="#f3e5f5" stroke="#6a1b9a"/><text x="343" y="129" text-anchor="middle" fill="#4a148c">Snapshot</text>
+  <rect x="398" y="110" width="70" height="30" rx="4" fill="#fff3e0" stroke="#e65100"/><text x="433" y="129" text-anchor="middle" fill="#bf360c">MERGE</text>
+  <rect x="482" y="110" width="82" height="30" rx="4" fill="#fff8e1" stroke="#c9a227"/><text x="523" y="129" text-anchor="middle" fill="#7a5c10">Time travel</text>
+  <rect x="578" y="110" width="108" height="30" rx="4" fill="#f8f9fa" stroke="#888"/><text x="632" y="129" text-anchor="middle" fill="#333">SCD1 / SCD2</text>
+  </g>
+  <g stroke="#455a64" stroke-width="1.4" marker-end="url(#a12)">
+  <line x1="96" y1="125" x2="106" y2="125"/><line x1="192" y1="125" x2="202" y2="125"/>
+  <line x1="288" y1="125" x2="298" y2="125"/><line x1="384" y1="125" x2="394" y2="125"/>
+  <line x1="468" y1="125" x2="478" y2="125"/><line x1="564" y1="125" x2="574" y2="125"/></g>
+  <text x="247" y="152" text-anchor="middle" font-size="6.8" fill="#666">commit</text>
+  <text x="343" y="152" text-anchor="middle" font-size="6.8" fill="#666">active files</text>
+  <text x="523" y="152" text-anchor="middle" font-size="6.8" fill="#666">old version</text>
+</svg>
+
+<h3>The twelve facts</h3>
+<table>
+<tr><td>1</td><td>Driver plans and schedules; executors compute; cores are task slots.</td></tr>
+<tr><td>2</td><td>One task per partition, per stage. Partitions are not owned by executors.</td></tr>
+<tr><td>3</td><td>Input partitions come from scan planning — file sizes, splittability, config.</td></tr>
+<tr><td>4</td><td>Stages are cut <b>only</b> at shuffle boundaries. Narrow ops pipeline together.</td></tr>
+<tr><td>5</td><td>Wide = the dependency crosses partitions. Not "many columns".</td></tr>
+<tr><td>6</td><td>groupBy: partial aggregate locally → shuffle by key → final aggregate.</td></tr>
+<tr><td>7</td><td>Delta = Parquet + a folder of JSON commits. The log is table-level.</td></tr>
+<tr><td>8</td><td>MERGE rewrites whole files; <code>remove</code> is logical, which is why time travel works.</td></tr>
+<tr><td>9</td><td>OPTIMIZE compacts; ZORDER makes stats selective; VACUUM deletes and ends time travel.</td></tr>
+<tr><td>10</td><td>Skew: max/median task duration &gt; 10×. More executors will not split one hot partition.</td></tr>
+<tr><td>11</td><td>Broadcast passes through the driver — it causes driver OOM too.</td></tr>
+<tr><td>12</td><td>Exactly-once needs a replayable source <b>and</b> an idempotent sink. Use <code>batchId</code>.</td></tr>
+</table>
+
+<div class="iv"><b>The closing sentence.</b> "I separate compute from data layout. Executors provide task slots,
+partitions define units of work, stages are separated by shuffle boundaries, and Delta Lake makes cloud-file
+storage transactional, versioned, and reliable for production data engineering."</div>
+
+<p class="small" style="margin-top:14pt; border-top:1px solid #ccc; padding-top:6pt">
+Consolidated from <i>Databricks Complete Spark + Delta Architecture Guide</i> (19 pp) and
+<i>Databricks Deep-Dive Interview Handbook</i> (24 pp). Overlapping sections merged, ordered as a learning
+path, and all diagrams redrawn as vector graphics.
+</p>

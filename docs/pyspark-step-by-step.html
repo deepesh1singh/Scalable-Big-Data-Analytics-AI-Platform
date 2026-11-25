@@ -1,0 +1,765 @@
+<meta charset="utf-8">
+<title>PySpark — Step by Step</title>
+<style>
+  @page { size: A4; margin: 15mm 14mm; }
+  body { font-family: -apple-system, "Helvetica Neue", Arial, sans-serif;
+         font-size: 10.4pt; line-height: 1.5; color: #16181d; margin: 0; }
+  h1 { font-size: 23pt; margin: 0 0 4pt; letter-spacing: -0.5pt; }
+  h2 { font-size: 15pt; margin: 0 0 8pt; padding: 5pt 0;
+       border-bottom: 2.5px solid #E25A1C; page-break-after: avoid; }
+  h3 { font-size: 11.5pt; margin: 12pt 0 4pt; color: #0b3d6b; page-break-after: avoid; }
+  p { margin: 5pt 0; }
+  ul, ol { margin: 5pt 0; padding-left: 17pt; }
+  li { margin: 3pt 0; }
+  code { font-family: "SF Mono", Menlo, monospace; font-size: 8.9pt;
+         background: #eef1f5; padding: 0.5pt 3pt; border-radius: 2px; }
+  pre { font-family: "SF Mono", Menlo, monospace; font-size: 8.4pt; line-height: 1.45;
+        background: #f6f8fa; border: 1px solid #d8dee4; border-left: 3px solid #E25A1C;
+        border-radius: 3px; padding: 7pt 9pt; white-space: pre-wrap;
+        page-break-inside: avoid; margin: 6pt 0; }
+  table { border-collapse: collapse; width: 100%; font-size: 9pt; margin: 6pt 0;
+          page-break-inside: avoid; }
+  th, td { border: 1px solid #c9d1d9; padding: 4pt 6pt; text-align: left; vertical-align: top; }
+  th { background: #eaeef2; font-weight: 600; }
+  .lesson { page-break-before: always; }
+  .warn { background: #fdeeee; border-left: 3px solid #c62828; border: 1px solid #e0b4b4;
+          padding: 7pt 9pt; margin: 7pt 0; font-size: 9.5pt; page-break-inside: avoid; }
+  .why { background: #eef7ee; border-left: 3px solid #2e7d32; border: 1px solid #b9d9b9;
+         padding: 7pt 9pt; margin: 7pt 0; font-size: 9.5pt; page-break-inside: avoid; }
+  .out { background: #1e2128; color: #d7dae0; border-left: 3px solid #6ba644;
+         padding: 6pt 9pt; margin: 5pt 0; font-family: "SF Mono", Menlo, monospace;
+         font-size: 8.3pt; white-space: pre-wrap; border-radius: 3px;
+         page-break-inside: avoid; }
+  .cover { border: 3px solid #16181d; padding: 18pt; margin-bottom: 12pt; }
+  .small { font-size: 8.9pt; color: #444; }
+  .step { display: inline-block; background: #16181d; color: #E25A1C; font-weight: 700;
+          padding: 1pt 8pt; border-radius: 3px; font-size: 10pt; margin-right: 6pt; }
+  .toc { font-size: 9.6pt; }
+  .toc td:first-child { width: 42pt; font-weight: 700; }
+</style>
+
+<div class="cover">
+<h1>PySpark — Step by Step</h1>
+<p class="small" style="margin-top:2pt">A practical path from install to production patterns. One dataset,
+twelve lessons, every concept demonstrated rather than described.</p>
+<table>
+<tr><th style="width:24%">How to use</th><td>Run every command. The value is in reading the query plan
+after each change &mdash; not in reading this document.</td></tr>
+<tr><td><b>Dataset</b></td><td>NYC Yellow Taxi, January 2024. 48 MB Parquet, 2,964,624 rows, one free
+download, no signup.</td></tr>
+<tr><td><b>Time</b></td><td>~4 hours. Lessons 1&ndash;6 in one sitting, 7&ndash;12 in another.</td></tr>
+<tr><td><b>Prereq</b></td><td>Python and SQL basics. No Spark knowledge assumed.</td></tr>
+</table>
+</div>
+
+<h3>Contents</h3>
+<table class="toc">
+<tr><td>1</td><td><b>Setup</b> &mdash; install, SparkSession, the Spark UI</td></tr>
+<tr><td>2</td><td><b>Loading data</b> &mdash; Parquet, CSV, and why schemas matter</td></tr>
+<tr><td>3</td><td><b>Lazy evaluation</b> &mdash; the concept everything else depends on</td></tr>
+<tr><td>4</td><td><b>Reading explain()</b> &mdash; how to see what Spark will actually do</td></tr>
+<tr><td>5</td><td><b>Transformations</b> &mdash; select, filter, withColumn</td></tr>
+<tr><td>6</td><td><b>Aggregations</b> &mdash; groupBy and your first shuffle</td></tr>
+<tr><td>7</td><td><b>Joins</b> &mdash; broadcast vs sort-merge</td></tr>
+<tr><td>8</td><td><b>Window functions</b> &mdash; ranking, running totals, lag</td></tr>
+<tr><td>9</td><td><b>Partitions and skew</b> &mdash; where jobs actually die</td></tr>
+<tr><td>10</td><td><b>Caching</b> &mdash; when it helps and when it hurts</td></tr>
+<tr><td>11</td><td><b>Writing data</b> &mdash; partitioning and the small-file problem</td></tr>
+<tr><td>12</td><td><b>Production</b> &mdash; the UI, tuning order, and the traps</td></tr>
+</table>
+
+<div class="why"><b>The one habit.</b> After every change, run <code>df.explain("formatted")</code> and diff the
+plan against the previous one. Not the timing &mdash; the <i>plan</i>. Timing tells you something changed; the
+plan tells you what and why. Count the <code>Exchange</code> nodes: each one is a shuffle, a stage boundary,
+and a place your job can die.</div>
+
+<!-- ===================== 1 ===================== -->
+<div class="lesson"></div>
+<h2><span class="step">1</span> Setup</h2>
+
+<h3>Install</h3>
+<pre>brew install openjdk@17           # Spark runs on the JVM
+pip install pyspark==3.5.1 pandas pyarrow</pre>
+
+<p>Verify:</p>
+<pre>python -c "import pyspark; print(pyspark.__version__)"
+java -version</pre>
+
+<h3>Your first SparkSession</h3>
+<pre>from pyspark.sql import SparkSession, functions as F
+
+spark = (SparkSession.builder
+    .appName("taxi-lab")
+    .master("local[4]")                              # 4 cores on this machine
+    .config("spark.driver.memory", "4g")
+    .config("spark.sql.shuffle.partitions", "8")     # default 200 is wrong for small data
+    .getOrCreate())
+
+spark.sparkContext.setLogLevel("WARN")               # Spark's INFO logging is a firehose
+print(spark.version)</pre>
+
+<table>
+<tr><td><code>master("local[4]")</code></td><td>Run driver and executor in one JVM with 4 task slots. Use
+<code>local[*]</code> for all cores. Omit entirely on a cluster.</td></tr>
+<tr><td><code>shuffle.partitions</code></td><td><b>The most important knob.</b> Default is 200. For small
+data that means 200 tiny tasks and scheduling overhead dominates. Rule of thumb: 2&ndash;4&times; your core
+count for small data.</td></tr>
+<tr><td><code>setLogLevel("WARN")</code></td><td>Non-negotiable. Otherwise your output is buried.</td></tr>
+</table>
+
+<h3>The Spark UI &mdash; open it now</h3>
+<p>While a job is running, visit <b><code>http://localhost:4040</code></b>. This is where you will spend most
+of your debugging time. It dies when the SparkSession stops, so in a script add:</p>
+<pre>input("Press Enter to shut down...")     # keeps the UI alive
+spark.stop()</pre>
+
+<div class="why">Notebooks are fine for learning, but the UI is the real teacher. Every lesson below ends with
+something to look at there.</div>
+
+<!-- ===================== 2 ===================== -->
+<div class="lesson"></div>
+<h2><span class="step">2</span> Loading data</h2>
+
+<h3>Get the dataset</h3>
+<pre>curl -O https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-01.parquet</pre>
+<p class="small">48 MB. Public domain, no signup.</p>
+
+<h3>Read it</h3>
+<pre>taxi = spark.read.parquet("yellow_tripdata_2024-01.parquet")
+
+taxi.printSchema()
+print(taxi.count())</pre>
+<div class="out">root
+ |-- VendorID: integer
+ |-- tpep_pickup_datetime: timestamp_ntz
+ |-- tpep_dropoff_datetime: timestamp_ntz
+ |-- passenger_count: long
+ |-- trip_distance: double
+ |-- PULocationID: integer
+ |-- fare_amount: double
+ ... 19 columns total
+
+2964624</div>
+
+<div class="why"><b>Both lines returned instantly. Why?</b><br>
+&bull; The <b>schema</b> came from the Parquet <i>footer</i> &mdash; a few KB of metadata, not the data.<br>
+&bull; <b>count()</b> was summed from row-group metadata, also without reading data.<br><br>
+Parquet is <b>self-describing</b>. This is the single biggest practical advantage over CSV.</div>
+
+<h3>CSV is different &mdash; and slower</h3>
+<pre># The lazy, wrong way
+df = spark.read.option("header","true").option("inferSchema","true").csv("data.csv")   # SLOW</pre>
+<div class="warn"><code>inferSchema=true</code> must read the <b>entire file</b> to guess types. It launches
+a real Spark job before you have called any action. On a 10 GB CSV that is a full scan you did not ask for.</div>
+
+<pre># The correct way — declare the schema
+df = (spark.read
+    .schema("id INT, name STRING, amount DOUBLE, ts TIMESTAMP")
+    .option("header", "true")
+    .option("mode", "FAILFAST")       # abort on bad rows instead of silently nulling them
+    .csv("data.csv"))</pre>
+
+<table>
+<tr><th>Mode</th><th>Behaviour on a malformed row</th></tr>
+<tr><td><code>PERMISSIVE</code> (default)</td><td>Silently nulls the bad fields. <b>How pipelines quietly
+lose data for months.</b></td></tr>
+<tr><td><code>FAILFAST</code></td><td>Abort immediately. Use in production.</td></tr>
+<tr><td><code>DROPMALFORMED</code></td><td>Discard bad rows without telling you.</td></tr>
+</table>
+
+<h3>Look at the data</h3>
+<pre>taxi.show(5)                        # prints a text table
+taxi.select("trip_distance", "fare_amount").describe().show()
+taxi.limit(20).toPandas()           # limit FIRST, then collect</pre>
+
+<div class="warn"><b>Never</b> <code>taxi.toPandas()</code> or <code>taxi.collect()</code> on a full table.
+Both pull every row into the driver's memory. On 3M rows you will survive; on 300M you will not.</div>
+
+<!-- ===================== 3 ===================== -->
+<div class="lesson"></div>
+<h2><span class="step">3</span> Lazy evaluation</h2>
+
+<p>This is the concept everything else depends on. Get it wrong and Spark's behaviour looks random.</p>
+
+<h3>Watch the clock</h3>
+<pre>import time
+
+t0 = time.time()
+pipeline = (taxi
+    .filter(F.col("trip_distance") > 0)
+    .filter(F.col("fare_amount") > 0)
+    .withColumn("hour", F.hour("tpep_pickup_datetime"))
+    .select("hour", "trip_distance", "fare_amount"))
+print(f"built in {time.time()-t0:.4f}s")
+
+t0 = time.time()
+print(pipeline.count())
+print(f"executed in {time.time()-t0:.2f}s")</pre>
+<div class="out">built in 0.0100s        &lt;-- four transformations, nothing computed
+2955089
+executed in 0.85s       &lt;-- the action did all the work</div>
+
+<div class="why"><b>A DataFrame is a recipe, not a result.</b> Each transformation returns a new DataFrame
+wrapping a new plan node. Nothing runs until an <b>action</b> demands a result. This lets Spark see your whole
+pipeline at once and optimise it before executing anything.</div>
+
+<h3>Transformations vs actions</h3>
+<table>
+<tr><th style="width:48%">Transformations (lazy)</th><th>Actions (trigger execution)</th></tr>
+<tr><td><code>select</code> <code>filter</code> <code>withColumn</code> <code>join</code>
+<code>groupBy</code> <code>orderBy</code> <code>drop</code> <code>distinct</code></td>
+<td><code>count()</code> <code>show()</code> <code>collect()</code> <code>take(n)</code>
+<code>write.*</code> <code>toPandas()</code></td></tr>
+</table>
+
+<h3>Actions ranked by danger</h3>
+<table>
+<tr><td><code>count()</code>, <code>show(n)</code>, <code>take(n)</code></td><td>Safe</td></tr>
+<tr><td><code>write.parquet(...)</code></td><td>Safe &mdash; the right way to materialise big results</td></tr>
+<tr><td><code>collect()</code>, <code>toPandas()</code></td><td><b>Driver OOM.</b> Pulls everything to one machine.</td></tr>
+</table>
+
+<h3>Spark does not remember results</h3>
+<pre>t0=time.time(); pipeline.count(); print(f"{time.time()-t0:.2f}s")
+t0=time.time(); pipeline.count(); print(f"{time.time()-t0:.2f}s")   # SAME cost</pre>
+<p>Both calls re-read and re-process everything. There is no automatic caching. This is why Lesson 10 exists,
+and why sprinkling <code>df.count()</code> between pipeline steps for logging can triple your runtime.</p>
+
+<p><b>In the UI:</b> Jobs tab &rarr; you should see one job per action, each with the same duration.</p>
+
+<!-- ===================== 4 ===================== -->
+<div class="lesson"></div>
+<h2><span class="step">4</span> Reading explain()</h2>
+
+<p>This is your <code>EXPLAIN</code>. Learn to read it and Spark stops being mysterious.</p>
+
+<pre>taxi.filter(F.col("fare_amount") > 100).select("fare_amount", "trip_distance") \
+    .explain("formatted")</pre>
+<div class="out">== Physical Plan ==
+* Project (4)
++- * Filter (3)
+   +- * ColumnarToRow (2)
+      +- Scan parquet (1)
+
+(1) Scan parquet
+Output [2]: [fare_amount#10, trip_distance#4]
+ReadSchema: struct&lt;trip_distance:double,fare_amount:double&gt;
+PushedFilters: [IsNotNull(fare_amount), GreaterThan(fare_amount,100.0)]</div>
+
+<h3>The four things to look for</h3>
+<table>
+<tr><td><b>Read bottom-up</b></td><td>Execution starts at the leaves (the scan) and flows up.</td></tr>
+<tr><td><b>The <code>*</code> prefix</b></td><td>Whole-stage code generation &mdash; these operators were
+fused into one tight Java loop. <b>Missing stars are a performance smell</b> (usually a Python UDF).</td></tr>
+<tr><td><b><code>PushedFilters</code></b></td><td>Filters handed to the file reader itself, which skips
+row groups using min/max statistics. Note Spark added <code>IsNotNull</code> for free.</td></tr>
+<tr><td><b><code>ReadSchema</code></b></td><td>Proof of column pruning &mdash; only 2 of 19 columns read.</td></tr>
+</table>
+
+<h3>What is <i>absent</i> matters most</h3>
+<div class="why">No <code>Exchange</code> node means <b>no shuffle</b>, which means this is one stage.
+<b>Scan any plan for <code>Exchange</code> and count them.</b> Each is a network transfer and a stage boundary.
+That count is your cost estimate before you run anything.</div>
+
+<h3>What does not push down</h3>
+<pre>taxi.filter(F.col("tpep_pickup_datetime") &lt; F.col("tpep_dropoff_datetime")).explain("formatted")</pre>
+<div class="out">PushedFilters: []          &lt;-- EMPTY</div>
+<p>Row-group statistics compare a column to a <b>literal</b>, never to another column. Column-to-column
+predicates and filters on derived columns always evaluate in Spark, after reading.</p>
+
+<h3>Plan vocabulary</h3>
+<table>
+<tr><td><code>Exchange hashpartitioning</code></td><td>Shuffle by key. Expensive.</td></tr>
+<tr><td><code>Exchange SinglePartition</code></td><td><b>Alarm.</b> Everything to one task.</td></tr>
+<tr><td><code>BroadcastHashJoin</code></td><td>The good join &mdash; no shuffle on the big side</td></tr>
+<tr><td><code>SortMergeJoin</code></td><td>The scalable join &mdash; 2 shuffles + 2 sorts</td></tr>
+<tr><td><code>HashAggregate</code> (&times;2)</td><td>Good &mdash; partial then final, map-side combine happened</td></tr>
+<tr><td><code>BatchEvalPython</code></td><td>A Python UDF. Codegen broken here.</td></tr>
+</table>
+
+<!-- ===================== 5 ===================== -->
+<div class="lesson"></div>
+<h2><span class="step">5</span> Transformations</h2>
+
+<pre>clean = (taxi
+    .filter(F.col("trip_distance") > 0)
+    .filter(F.col("fare_amount") > 0)
+    .filter(F.col("passenger_count").between(1, 6))
+    .withColumn("duration_min",
+        (F.unix_timestamp("tpep_dropoff_datetime") -
+         F.unix_timestamp("tpep_pickup_datetime")) / 60.0)
+    .filter(F.col("duration_min").between(1, 240))
+    .withColumn("mph", F.col("trip_distance") / (F.col("duration_min") / 60.0))
+    .filter(F.col("mph") &lt; 100)
+    .withColumn("hour", F.hour("tpep_pickup_datetime"))
+    .withColumn("dow",  F.date_format("tpep_pickup_datetime", "E"))
+    .withColumn("tip_pct", F.round(100 * F.col("tip_amount") / F.col("fare_amount"), 1)))
+
+print(f"kept {clean.count() / taxi.count():.1%}")</pre>
+<div class="out">kept 95.2%</div>
+
+<div class="why"><b>Always print the retention ratio.</b> A filter that unexpectedly drops 40% of rows is a
+bug you want to find here, not in a dashboard three weeks later.</div>
+
+<h3>Nulls will silently eat your rows</h3>
+<pre>taxi.filter(F.col("passenger_count").isNull()).count()</pre>
+<p>Roughly 5% of rows have a null <code>passenger_count</code>. The filter
+<code>.between(1,6)</code> <b>drops every one of them</b>, because in SQL
+<code>NULL BETWEEN 1 AND 6</code> evaluates to <code>NULL</code>, not <code>TRUE</code> &mdash; and only
+<code>TRUE</code> passes a filter.</p>
+
+<div class="warn"><b>Three-valued logic is the #1 silent bug in Spark.</b> A row with a null fails both
+<code>cond</code> and <code>~cond</code>. So splitting data into "valid" and "invalid" branches this way
+loses rows from both. Always assert:
+<pre>assert valid.count() + invalid.count() == total.count()</pre></div>
+
+<h3>Auditing nulls</h3>
+<pre>taxi.select([
+    F.sum(F.col(c).isNull().cast("int")).alias(c) for c in taxi.columns
+]).show()</pre>
+<p><code>count(col)</code> <i>skips</i> nulls, so you cannot count nulls with it. Convert the condition to
+1/0 and sum. The list comprehension does all columns in one pass.</p>
+
+<h3>The withColumn-in-a-loop trap</h3>
+<pre># DON'T — one plan node per iteration. With 500 columns this hangs the DRIVER
+# for minutes on ZERO rows of data.
+for c in cols:
+    df = df.withColumn(c, F.trim(F.col(c)))
+
+# DO — one plan node
+df = df.select(*[F.trim(F.col(c)).alias(c) for c in cols])</pre>
+<p>Catalyst's rule application is roughly quadratic in plan depth. This is a genuine production incident
+pattern.</p>
+
+<!-- ===================== 6 ===================== -->
+<div class="lesson"></div>
+<h2><span class="step">6</span> Aggregations &mdash; your first shuffle</h2>
+
+<pre>hourly = (clean
+    .groupBy("hour")
+    .agg(
+        F.count("*").alias("trips"),
+        F.round(F.avg("fare_amount"), 2).alias("avg_fare"),
+        F.round(F.avg("mph"), 1).alias("avg_mph"),
+        F.expr("percentile_approx(duration_min, 0.5)").alias("p50_min"),
+        F.expr("percentile_approx(duration_min, 0.95)").alias("p95_min"))
+    .orderBy("hour"))
+
+hourly.show(24)</pre>
+<div class="out">hour  trips    avg_fare  avg_mph  p50_min  p95_min
+   0   41429     21.65     14.2     11.0     31.0
+   5   19827     23.10     22.8      9.0     26.0     &lt;- fastest hour
+  17  178901     18.90      9.1     15.0     42.0     &lt;- slowest hour</div>
+
+<div class="why"><b>Use percentiles, not averages, for anything latency-shaped.</b> p95 runs 2&ndash;3&times;
+p50 here. The mean tells you neither the typical case nor the bad case.</div>
+
+<h3>What physically happens</h3>
+<pre>hourly.explain("formatted")</pre>
+<div class="out">HashAggregate(keys=[hour], functions=[... FINAL ...])
++- Exchange hashpartitioning(hour, 8)            &lt;-- THE SHUFFLE
+   +- HashAggregate(keys=[hour], ... PARTIAL)    &lt;-- map-side combine
+      +- Scan parquet</div>
+
+<ol>
+<li><b>Partial aggregate</b> &mdash; each input partition builds a local hash map. 3M rows collapse to at most
+24 partial rows <b>before</b> anything crosses the network.</li>
+<li><b>Exchange</b> &mdash; partial rows are sent to partition <code>hash(hour) % 8</code>. Each map task
+writes shuffle files to local disk.</li>
+<li><b>Final aggregate</b> &mdash; merges the partials per key.</li>
+</ol>
+
+<div class="why"><code>avg</code> is decomposed into <code>sum</code> and <code>count</code> precisely because
+that decomposition is <b>associative</b>. That is what makes distributed averaging possible at all.</div>
+
+<h3>The expensive one: countDistinct</h3>
+<pre>F.countDistinct("PULocationID")                       # slow
+F.approx_count_distinct("PULocationID", 0.02)         # 10-100x faster, 2% error</pre>
+<p>Distinct counts are <b>not</b> mergeable &mdash; you cannot combine two partial distinct-counts without the
+underlying values. So Spark must shuffle raw pairs instead of compressed partials.
+<code>approx_count_distinct</code> uses a fixed-size HyperLogLog sketch, which <i>is</i> mergeable.</p>
+
+<h3>Conditional aggregation in one pass</h3>
+<pre>clean.groupBy("dow").agg(
+    F.count("*").alias("trips"),
+    F.sum(F.when(F.col("tip_pct") > 20, 1).otherwise(0)).alias("big_tips"),
+    F.round(F.avg(F.when(F.col("hour") &lt; 6, F.col("fare_amount"))), 2).alias("night_fare")
+).show()</pre>
+
+<p><b>In the UI:</b> Stages tab &rarr; find the stage with non-zero "Shuffle Write" &rarr; open <b>Summary
+Metrics</b>. Compare <b>median vs max</b> task duration. That comparison is the most useful thing in the UI.</p>
+
+<!-- ===================== 7 ===================== -->
+<div class="lesson"></div>
+<h2><span class="step">7</span> Joins</h2>
+
+<pre>curl -O https://d37ci6vzurychx.cloudfront.net/misc/taxi_zone_lookup.csv</pre>
+
+<pre>zones = (spark.read
+    .option("header", "true")
+    .schema("LocationID INT, Borough STRING, Zone STRING, service_zone STRING")
+    .csv("taxi_zone_lookup.csv"))
+
+print(zones.count())        # 265 rows — tiny, ideal broadcast candidate
+
+pickup = (zones
+    .withColumnRenamed("LocationID", "PULocationID")
+    .withColumnRenamed("Zone", "pickup_zone")
+    .withColumnRenamed("Borough", "pickup_borough")
+    .select("PULocationID", "pickup_zone", "pickup_borough"))
+
+enriched = clean.join(F.broadcast(pickup), "PULocationID", "left")
+enriched.explain("formatted")</pre>
+<div class="out">BroadcastHashJoin [PULocationID], [PULocationID], LeftOuter, BuildRight
+:- Scan parquet ...                    &lt;-- NO Exchange on the big side!
++- BroadcastExchange HashedRelationBroadcastMode</div>
+
+<h3>Join types</h3>
+<table>
+<tr><th>Type</th><th>Returns</th></tr>
+<tr><td><code>inner</code></td><td>Only matching rows</td></tr>
+<tr><td><code>left</code></td><td>All left rows; nulls where no match</td></tr>
+<tr><td><code>left_semi</code></td><td>Left rows that <b>have</b> a match. Left columns only. <b>Never duplicates.</b></td></tr>
+<tr><td><code>left_anti</code></td><td>Left rows with <b>no</b> match. The cleanest way to find orphans.</td></tr>
+</table>
+
+<pre># find trips referencing an unknown zone
+clean.join(pickup, "PULocationID", "left_anti").count()</pre>
+
+<h3>The two strategies</h3>
+<table>
+<tr><th>Strategy</th><th>How it works</th><th>Cost</th></tr>
+<tr><td><b>BroadcastHashJoin</b></td><td>Small side copied to every executor; big side never moves</td>
+<td>Fast. Needs the small side to fit in memory.</td></tr>
+<tr><td><b>SortMergeJoin</b></td><td>Both sides shuffled by key <i>and</i> sorted, then merged</td>
+<td>Scales to any size. 2 shuffles + 2 sorts.</td></tr>
+</table>
+
+<pre># force sort-merge to compare
+smj = clean.join(pickup.hint("merge"), "PULocationID", "left")
+smj.explain("formatted")    # now shows TWO Exchange nodes</pre>
+
+<div class="warn"><b>Broadcast passes through the DRIVER.</b> Spark collects the small side to the driver,
+builds a hash table, then ships it out. A 2 GB broadcast needs 2 GB of <i>driver</i> heap plus 2 GB on
+<i>every</i> executor. Broadcasts cause driver OOM, not just executor OOM.<br><br>
+<code>broadcast()</code> is a <b>hint</b>, not a guarantee. Spark ignores it for FULL OUTER joins. Always
+verify <code>BroadcastHashJoin</code> in the plan.</div>
+
+<h3>The many-to-many explosion</h3>
+<div class="warn"><b>The #1 cause of a "should be fast" join running for hours.</b> Duplicate keys on both
+sides multiply rows: 1000 &times; 1000 matching rows for one key produces 1,000,000 output rows from 2,000
+inputs.<br><br>Check <b>before</b> joining:
+<pre>for name, d in [("left", clean), ("right", pickup)]:
+    n = d.groupBy("PULocationID").count().filter("count > 1").count()
+    print(name, "duplicate keys:", n)</pre></div>
+
+<!-- ===================== 8 ===================== -->
+<div class="lesson"></div>
+<h2><span class="step">8</span> Window functions</h2>
+
+<p>Anything of the form "compare this row to others in its group" is a window.</p>
+
+<pre>from pyspark.sql.window import Window
+
+w = Window.partitionBy("pickup_borough").orderBy(F.desc("trips"))
+
+zone_rank = (enriched
+    .groupBy("pickup_borough", "pickup_zone")
+    .agg(F.count("*").alias("trips"),
+         F.round(F.avg("fare_amount"), 2).alias("avg_fare"))
+    .withColumn("rank", F.row_number().over(w))
+    .withColumn("borough_total", F.sum("trips").over(Window.partitionBy("pickup_borough")))
+    .withColumn("pct", F.round(100 * F.col("trips") / F.col("borough_total"), 1))
+    .filter(F.col("rank") &lt;= 5)
+    .orderBy("pickup_borough", "rank"))
+
+zone_rank.show(30)</pre>
+
+<div class="why"><code>pct</code> compares each row to its <b>group's</b> aggregate with <b>no self-join</b>.
+That is the main reason window functions exist.</div>
+
+<h3>A window is a shuffle in disguise</h3>
+<div class="out">Window [...]
++- Sort [pickup_borough, trips DESC]
+   +- Exchange hashpartitioning(pickup_borough, 8)     &lt;-- shuffle + sort</div>
+<p>Nothing in the syntax hints at this. Both window specs above partition by the same column, so Spark reuses
+<b>one</b> Exchange. Reusing the partitioning key across specs is a real and underused optimisation.</p>
+
+<h3>rank vs row_number vs dense_rank</h3>
+<pre>amounts:  500, 300, 300, 100
+row_number:  1, 2, 3, 4      strictly sequential, ties broken arbitrarily
+rank:        1, 2, 2, 4      ties share, gaps appear
+dense_rank:  1, 2, 2, 3      ties share, no gaps</pre>
+<div class="warn"><code>filter(row_number &lt;= 3)</code> gives <b>exactly 3</b> rows.
+<code>filter(rank &lt;= 3)</code> can give 50 if there are ties. "Top N per group" almost always means
+<code>row_number</code>. Choosing wrong is a silent correctness bug &mdash; nothing errors.</div>
+
+<h3>Running totals and lag</h3>
+<pre>w_time = Window.partitionBy("PULocationID").orderBy("tpep_pickup_datetime")
+
+(clean
+ .withColumn("running_fares", F.sum("fare_amount").over(w_time))
+ .withColumn("prev_fare",     F.lag("fare_amount", 1).over(w_time))
+ .withColumn("delta",         F.col("fare_amount") - F.lag("fare_amount", 1, 0.0).over(w_time))
+ .withColumn("ma_10",         F.avg("fare_amount").over(w_time.rowsBetween(-9, 0))))</pre>
+
+<table>
+<tr><td><b>Default frame</b> with <code>orderBy</code></td><td><code>unboundedPreceding &rarr; currentRow</code>
+&mdash; a <b>running</b> total</td></tr>
+<tr><td><b>Default frame</b> with no <code>orderBy</code></td><td>The <b>entire partition</b> &mdash; a group total</td></tr>
+</table>
+<p>Same function, completely different answer. Most "my window result is wrong" bugs are this default.</p>
+
+<div class="warn"><b>Never omit <code>partitionBy</code>.</b>
+<pre>Window.orderBy("ts")     # NO partitionBy — all rows to ONE partition</pre>
+The plan shows <code>Exchange SinglePartition</code>: one task, one core, the whole dataset. Spark even logs a
+warning about it.</div>
+
+<!-- ===================== 9 ===================== -->
+<div class="lesson"></div>
+<h2><span class="step">9</span> Partitions and skew</h2>
+
+<p>A partition is a chunk of data processed by one task. Partition count = parallelism.</p>
+
+<h3>See the distribution</h3>
+<pre>(clean
+ .withColumn("pid", F.spark_partition_id())
+ .groupBy("pid").count().orderBy("pid").show())</pre>
+<p><code>spark_partition_id()</code> exposes the physical partition index as a column. <b>The best diagnostic
+function in Spark</b> &mdash; it turns an invisible property into a queryable table.</p>
+
+<h3>repartition vs coalesce</h3>
+<table>
+<tr><th></th><th><code>repartition(n)</code></th><th><code>coalesce(n)</code></th></tr>
+<tr><td>Shuffle</td><td>Yes, full</td><td>No</td></tr>
+<tr><td>Can increase count</td><td>Yes</td><td><b>No</b> (silently ignored)</td></tr>
+<tr><td>Even distribution</td><td>Yes</td><td>No</td></tr>
+<tr><td>Use for</td><td>Fixing skew, preparing a join</td><td>Reducing output files at the very end</td></tr>
+</table>
+
+<div class="warn"><b>The <code>coalesce(1)</code> trap.</b>
+<pre>big_df.coalesce(1).write.parquet(path)      # DANGEROUS
+big_df.repartition(1).write.parquet(path)   # safe</pre>
+Because <code>coalesce</code> does not shuffle, it <b>propagates upstream</b> and reduces the parallelism of
+the <i>entire preceding stage</i> to 1. Your 100-core aggregation now runs single-threaded.
+<code>repartition(1)</code> inserts an Exchange, creating a stage boundary, so upstream work keeps its
+parallelism.</div>
+
+<h3>Skew &mdash; measure it</h3>
+<pre>(clean.groupBy("PULocationID").count()
+      .agg(F.min("count").alias("min"),
+           F.expr("percentile_approx(count, 0.5)").alias("p50"),
+           F.max("count").alias("max"))
+      .show())</pre>
+<p>Read the <b>max / p50</b> ratio. Above ~10&times; means one task does an order of magnitude more work than
+the median, and <b>a stage cannot finish until its slowest task does</b>.</p>
+
+<div class="why">Real keys follow a Zipf distribution. Users, merchants, device ids, product SKUs routinely
+show 1000&times;+ ratios. Anyone who has run Spark in production has been paged because of this.</div>
+
+<h3>Fixing skew</h3>
+<p><b>1. Let AQE handle it</b> (Spark 3+, on by default). It splits oversized shuffle partitions after seeing
+real sizes, and replicates the matching side.</p>
+<pre>spark.conf.set("spark.sql.adaptive.enabled", "true")
+spark.conf.set("spark.sql.adaptive.skewJoin.enabled", "true")</pre>
+<p class="small">Limitation: helps <b>joins</b> only. Not skewed groupBy, not windows.</p>
+
+<p><b>2. Salting</b> &mdash; the manual technique.</p>
+<pre>SALT = 16
+big   = df.withColumn("salt", (F.rand(seed=42) * SALT).cast("int")) \
+          .withColumn("skey", F.concat_ws("_", "key", "salt"))
+
+# the small side must be REPLICATED, once per salt value
+small = dim.withColumn("salt", F.explode(F.array([F.lit(i) for i in range(SALT)]))) \
+           .withColumn("skey", F.concat_ws("_", "key", "salt"))
+
+result = big.join(small, "skey").groupBy("key").agg(...)   # aggregate back on the REAL key</pre>
+
+<div class="warn"><b>The small side must be replicated, not salted randomly.</b> If you salted both sides
+randomly, a big-side row with salt 7 would never meet its partner at salt 3 and you would <b>silently lose
+rows</b>. This is the step people get wrong in interviews.<br><br>
+Also: <b>seed the rand()</b>. Unseeded makes the job non-deterministic, so a retried task assigns different
+salts than its first attempt.</div>
+
+<!-- ===================== 10 ===================== -->
+<div class="lesson"></div>
+<h2><span class="step">10</span> Caching</h2>
+
+<pre>from pyspark import StorageLevel
+
+base = clean.select("hour", "PULocationID", "fare_amount", "mph")
+
+# WITHOUT cache — three actions, three full recomputes
+t0 = time.time()
+base.count()
+base.select("PULocationID").distinct().count()
+base.groupBy("hour").count().count()
+t_nocache = time.time() - t0
+
+# WITH cache
+base.persist(StorageLevel.MEMORY_AND_DISK)
+base.count()                 # materialise — this call pays the cost
+t0 = time.time()
+base.count()
+base.select("PULocationID").distinct().count()
+base.groupBy("hour").count().count()
+t_cache = time.time() - t0
+base.unpersist()
+
+print(f"no cache {t_nocache:.1f}s   cached {t_cache:.1f}s")</pre>
+<div class="out">no cache 4.2s   cached 1.1s      (roughly 4x on this dataset)</div>
+
+<h3>The rules</h3>
+<table>
+<tr><td><code>persist()</code> is <b>lazy</b></td><td>It only registers intent. Call an action to actually
+cache. Forgetting this makes your benchmark meaningless.</td></tr>
+<tr><td><code>MEMORY_AND_DISK</code></td><td>The right default. Blocks that don't fit spill to disk rather
+than being dropped. <code>cache()</code> is an alias for this on DataFrames.</td></tr>
+<tr><td><code>unpersist()</code></td><td>Always. In a long-running app, forgotten caches occupy storage
+memory forever and starve execution memory.</td></tr>
+</table>
+
+<h3>When caching makes things slower</h3>
+<div class="warn">
+&bull; <b>Used once.</b> You pay materialisation and memory for zero reuse. Cache only what is read 2+ times.<br>
+&bull; <b>Cache evicts cache.</b> Storage and execution share one memory region. A big cache causes shuffle
+spill in <i>other</i> stages &mdash; you made stage 3 faster and stage 7 slower.<br>
+&bull; <b>Caching blocks pushdown.</b> Caching <i>before</i> filtering materialises everything and prevents
+filters reaching the scan. Cache the <b>narrow, filtered</b> DataFrame, not the raw source.
+</div>
+
+<p><b>In the UI:</b> Storage tab &rarr; shows what is actually cached and how much fits in memory. A DataFrame
+showing "40% cached" is giving you almost no benefit while consuming memory.</p>
+
+<!-- ===================== 11 ===================== -->
+<div class="lesson"></div>
+<h2><span class="step">11</span> Writing data</h2>
+
+<pre>(enriched
+    .withColumn("pickup_date", F.to_date("tpep_pickup_datetime"))
+    .repartition("pickup_date")            # &lt;-- pair with partitionBy
+    .write
+    .mode("overwrite")
+    .partitionBy("pickup_date")
+    .option("compression", "snappy")
+    .parquet("output/trips"))</pre>
+
+<div class="why"><b>The most important line here is <code>repartition("pickup_date")</code> before
+<code>partitionBy("pickup_date")</code>.</b><br><br>
+Without it, <b>every</b> task can hold rows for <b>every</b> date, so each task writes one small file per date:
+<code>n_tasks &times; n_dates</code> files. With 200 tasks and 30 dates that is 6,000 tiny files. With it, each
+task holds one date.</div>
+
+<h3>Why small files hurt &mdash; four separate costs</h3>
+<table>
+<tr><td>1. <b>Listing</b></td><td>The driver enumerates every file. On S3 this is paginated API calls and can
+take <i>minutes</i> with the cluster idle.</td></tr>
+<tr><td>2. <b>Tasks</b></td><td>One task per file &mdash; thousands each doing microseconds of real work.</td></tr>
+<tr><td>3. <b>Metadata</b></td><td>Every Parquet file has a footer. With tiny files the footer can exceed the data.</td></tr>
+<tr><td>4. <b>Compression</b></td><td>Dictionary and RLE encodings need volume to be effective.</td></tr>
+</table>
+<p>Target <b>128 MB &ndash; 1 GB</b> per file.</p>
+
+<h3>Verify partition pruning works</h3>
+<pre>out = spark.read.parquet("output/trips")
+out.filter(F.col("pickup_date") == "2024-01-15").explain("formatted")</pre>
+<div class="out">PartitionFilters: [isnotnull(pickup_date), (pickup_date = 2024-01-15)]</div>
+<p>Whole directories are skipped &mdash; those files are never opened. Cost order:<br>
+<b>partition pruning</b> (directory level, free) &gt; <b>row-group pushdown</b> (file level, cheap) &gt;
+<b>full scan then filter</b> (expensive).</p>
+
+<h3>Write modes</h3>
+<table>
+<tr><td><code>overwrite</code></td><td>Replaces. <b>On a partitioned table this deletes EVERY partition</b>
+unless you set <code>spark.sql.sources.partitionOverwriteMode=dynamic</code>.</td></tr>
+<tr><td><code>append</code></td><td>Adds files, keeps existing</td></tr>
+<tr><td><code>error</code></td><td>Fails if path exists (default)</td></tr>
+</table>
+<div class="warn">Static overwrite mode + a one-day incremental load = you just deleted five years of history.
+Set <code>dynamic</code> for any incremental pipeline.</div>
+
+<!-- ===================== 12 ===================== -->
+<div class="lesson"></div>
+<h2><span class="step">12</span> Production</h2>
+
+<h3>The Spark UI &mdash; what to click, in order</h3>
+<table>
+<tr><td><b>Jobs</b></td><td>Which job is slow. One job per action. More jobs than actions means something
+extra ran (schema inference, a broadcast collect).</td></tr>
+<tr><td><b>Stages</b></td><td>Open the slow stage &rarr; <b>Summary Metrics</b>. Compare median vs max for
+Duration, Shuffle Read, and Spill.</td></tr>
+<tr><td><b>SQL / DataFrame</b></td><td><b>The most valuable tab.</b> The plan as a DAG with per-operator row
+counts and timings.</td></tr>
+<tr><td><b>Storage</b></td><td>What is actually cached and how much fits.</td></tr>
+<tr><td><b>Executors</b></td><td>GC time, failed tasks, shuffle I/O per executor.</td></tr>
+</table>
+
+<h3>Metrics and their thresholds</h3>
+<table>
+<tr><th>Metric</th><th>Healthy</th><th>Investigate when</th></tr>
+<tr><td>Task max / median duration</td><td>&lt; 3&times;</td><td><b>&gt; 10&times; &rarr; skew</b></td></tr>
+<tr><td>Shuffle read per task</td><td>50&ndash;200 MB</td><td>&gt; 1 GB: raise partitions. &lt; 5 MB: lower them.</td></tr>
+<tr><td>Spill (disk)</td><td>0</td><td>&gt; 0 and large &rarr; partitions too big</td></tr>
+<tr><td>GC time</td><td>&lt; 10% of task time</td><td>&gt; 20% &rarr; memory pressure</td></tr>
+<tr><td>Task count per stage</td><td>2&ndash;4&times; cores</td><td>&gt; 10&times;: overhead. &lt; 1&times;: idle cores.</td></tr>
+</table>
+
+<h3>The tuning order &mdash; follow it</h3>
+<table>
+<tr><td>1</td><td><b>Reduce data</b></td><td>Filter early, select only needed columns, exploit partition pruning</td></tr>
+<tr><td>2</td><td><b>Fix the plan</b></td><td>Broadcast small dimensions, avoid gratuitous repartitions</td></tr>
+<tr><td>3</td><td><b>Fix skew</b></td><td>AQE, then salting</td></tr>
+<tr><td>4</td><td><b>Size partitions</b></td><td><code>shuffle.partitions</code> for ~128 MB per task</td></tr>
+<tr><td>5</td><td><b>Then</b> add memory or executors</td><td>Only after all of the above</td></tr>
+</table>
+<p>Reversing this order is what a weak engineer does. Most "we need a bigger cluster" problems are step 1 or 3.</p>
+
+<h3>UDFs &mdash; the cost hierarchy</h3>
+<pre>1. Built-in functions       1x        stays in JVM codegen — 400+ of them exist
+2. Pandas UDF (Arrow)      2-4x      vectorised batches
+3. Python UDF             10-50x     per-row pickling + socket IPC</pre>
+<pre># if you must use one, FILTER FIRST — Catalyst will not push a filter through a UDF
+df.filter("length(text) > 20").withColumn("score", my_udf("text"))</pre>
+
+<h3>Symptom &rarr; cause &rarr; fix</h3>
+<table>
+<tr><th style="width:26%">Symptom</th><th>Likely cause</th><th>Fix</th></tr>
+<tr><td>One task 50&times; slower</td><td>Skew</td><td>AQE &rarr; salt &rarr; broadcast</td></tr>
+<tr><td>Driver OOM</td><td><code>collect()</code>, huge broadcast, giant plan</td><td>Write instead of collect</td></tr>
+<tr><td>Executor OOM</td><td>Skewed partition, oversized broadcast</td><td>Fix skew first, memory last</td></tr>
+<tr><td>Slow, cluster idle</td><td>Driver work: file listing, schema inference</td><td>Explicit schemas, compact files</td></tr>
+<tr><td>Thousands of tiny files</td><td>No repartition before partitionBy</td><td>Lesson 11</td></tr>
+<tr><td>Adding executors doesn't help</td><td>Too few partitions, or skew</td><td>Check task count vs cores</td></tr>
+<tr><td>Row counts differ between runs</td><td><code>dropDuplicates</code>, unseeded <code>rand()</code></td><td>Use windows, seed randomness</td></tr>
+</table>
+
+<h3>The traps, collected</h3>
+<table>
+<tr><td>1</td><td>Explicit schemas. <code>inferSchema</code> is a full scan.</td></tr>
+<tr><td>2</td><td>Three-valued logic: a null row fails both <code>cond</code> and <code>~cond</code>.</td></tr>
+<tr><td>3</td><td><code>count(col)</code> skips nulls; <code>count("*")</code> does not.</td></tr>
+<tr><td>4</td><td>Never <code>withColumn</code> in a loop &mdash; use one <code>select</code>.</td></tr>
+<tr><td>5</td><td>Column-to-column and derived-column filters never push down.</td></tr>
+<tr><td>6</td><td>Broadcast passes through the driver &mdash; it causes driver OOM too.</td></tr>
+<tr><td>7</td><td>Duplicate keys on both sides of a join multiply rows.</td></tr>
+<tr><td>8</td><td><code>row_number</code> not <code>rank</code> for "top N per group".</td></tr>
+<tr><td>9</td><td>A window with no <code>partitionBy</code> = one task for everything.</td></tr>
+<tr><td>10</td><td><code>coalesce(1)</code> propagates upstream. Use <code>repartition(1)</code>.</td></tr>
+<tr><td>11</td><td><code>repartition(col)</code> before <code>partitionBy(col)</code>. Always.</td></tr>
+<tr><td>12</td><td>Cache only what is read 2+ times, and <code>unpersist()</code> after.</td></tr>
+</table>
+
+<h3>Where to go next</h3>
+<ul>
+<li>Rewrite an existing pipeline of yours using these patterns and diff the plans</li>
+<li>Load a month with a glob (<code>yellow_tripdata_2024-*.parquet</code>) and hit real schema drift &mdash;
+some months name a column <code>Airport_fee</code>, others <code>airport_fee</code></li>
+<li>Try Structured Streaming: the same DataFrame API over an unbounded input</li>
+<li>Official docs: <code>spark.apache.org/docs/latest/sql-programming-guide.html</code></li>
+</ul>
+
+<p class="small" style="margin-top:16pt; border-top:1px solid #ccc; padding-top:6pt">
+Dataset: NYC TLC Trip Record Data (public domain), January 2024 Yellow Taxi, 2,964,624 rows. Row counts are
+exact; timings are indicative for a 4-core laptop and will vary with your hardware &mdash; the <i>ratios</i>
+are what matter. Written for PySpark 3.5.
+</p>

@@ -1,0 +1,395 @@
+<meta charset="utf-8">
+<title>S3 → Redshift + Databricks Delta — Architecture</title>
+<style>
+  @page { size: A4; margin: 14mm 13mm; }
+  body { font-family: -apple-system, "Helvetica Neue", Arial, sans-serif;
+         font-size: 10.3pt; line-height: 1.5; color: #16181d; margin: 0; }
+  h1 { font-size: 22pt; margin: 0 0 4pt; letter-spacing: -0.5pt; }
+  h2 { font-size: 15pt; margin: 0 0 8pt; padding: 5pt 0;
+       border-bottom: 2.5px solid #FF9900; page-break-after: avoid; }
+  h3 { font-size: 11.5pt; margin: 12pt 0 4pt; color: #0b3d6b; page-break-after: avoid; }
+  p { margin: 5pt 0; }
+  ul, ol { margin: 5pt 0; padding-left: 17pt; }
+  li { margin: 3pt 0; }
+  code { font-family: "SF Mono", Menlo, monospace; font-size: 8.8pt;
+         background: #eef1f5; padding: 0.5pt 3pt; border-radius: 2px; }
+  pre { font-family: "SF Mono", Menlo, monospace; font-size: 8.3pt; line-height: 1.45;
+        background: #f6f8fa; border: 1px solid #d8dee4; border-left: 3px solid #FF9900;
+        border-radius: 3px; padding: 7pt 9pt; white-space: pre-wrap;
+        page-break-inside: avoid; margin: 6pt 0; }
+  table { border-collapse: collapse; width: 100%; font-size: 9pt; margin: 6pt 0;
+          page-break-inside: avoid; }
+  th, td { border: 1px solid #c9d1d9; padding: 4pt 6pt; text-align: left; vertical-align: top; }
+  th { background: #eaeef2; font-weight: 600; }
+  .page { page-break-before: always; }
+  .warn { background: #fdeeee; border-left: 3px solid #c62828; border: 1px solid #e0b4b4;
+          padding: 7pt 9pt; margin: 7pt 0; font-size: 9.5pt; page-break-inside: avoid; }
+  .why { background: #eef7ee; border-left: 3px solid #2e7d32; border: 1px solid #b9d9b9;
+         padding: 7pt 9pt; margin: 7pt 0; font-size: 9.5pt; page-break-inside: avoid; }
+  .cover { border: 3px solid #16181d; padding: 16pt; margin-bottom: 10pt; }
+  .small { font-size: 8.9pt; color: #444; }
+  svg { display: block; margin: 8pt auto; max-width: 100%; }
+  .cap { text-align: center; font-size: 8.7pt; color: #555; font-style: italic; margin-top: -2pt; }
+</style>
+
+<div class="cover">
+<h1>S3 &rarr; Redshift &amp; Databricks Delta</h1>
+<p class="small" style="margin-top:2pt">One S3 bucket, two consumers. How Parquet gets into Redshift, and how
+Databricks stores its tables in the same place.</p>
+<table>
+<tr><th style="width:22%">Account</th><td><code>457360056131</code> &middot; region <code>us-east-1</code></td></tr>
+<tr><th>Bucket</th><td><code>s3://naveen-data-lab-457360056131/</code></td></tr>
+<tr><th>Path 1</th><td>S3 Parquet &rarr; <b>Redshift</b> via <code>COPY</code> (or Spectrum / Glue / Zero-ETL)</td></tr>
+<tr><th>Path 2</th><td><b>Databricks</b> &rarr; Delta tables written back to the <i>same</i> bucket</td></tr>
+</table>
+</div>
+
+<h2>The whole picture</h2>
+
+<svg viewBox="0 0 720 470" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial" font-size="11">
+  <defs>
+    <marker id="a" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#444"/>
+    </marker>
+    <marker id="ag" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#2e7d32"/>
+    </marker>
+    <marker id="ab" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#c2410c"/>
+    </marker>
+  </defs>
+
+  <!-- SOURCES -->
+  <rect x="16" y="14" width="150" height="66" rx="6" fill="#eef2f8" stroke="#5b7fa8" stroke-width="1.5"/>
+  <text x="91" y="34" text-anchor="middle" font-weight="bold" fill="#1b3a5c">SOURCES</text>
+  <text x="91" y="51" text-anchor="middle" font-size="9.5" fill="#333">Kafka · APIs · DBs</text>
+  <text x="91" y="66" text-anchor="middle" font-size="9.5" fill="#333">files · exports</text>
+
+  <line x1="91" y1="80" x2="91" y2="118" stroke="#444" stroke-width="1.6" marker-end="url(#a)"/>
+  <text x="99" y="103" font-size="9" fill="#555">write Parquet</text>
+
+  <!-- S3 BUCKET -->
+  <rect x="16" y="122" width="330" height="234" rx="8" fill="#fff8ee" stroke="#FF9900" stroke-width="2.5"/>
+  <text x="181" y="144" text-anchor="middle" font-weight="bold" font-size="12.5" fill="#8a5200">
+    Amazon S3 — one bucket</text>
+  <text x="181" y="159" text-anchor="middle" font-size="8.6" fill="#8a5200">
+    naveen-data-lab-457360056131</text>
+
+  <!-- raw prefix -->
+  <rect x="32" y="172" width="298" height="66" rx="5" fill="#fff" stroke="#c9a24a"/>
+  <text x="42" y="189" font-size="9.6" font-weight="bold" fill="#7a5c10">raw/  —  plain Parquet</text>
+  <text x="42" y="204" font-size="8.8" font-family="monospace" fill="#444">raw/taxi/yellow_2024_01.parquet</text>
+  <text x="42" y="217" font-size="8.8" font-family="monospace" fill="#444">raw/taxi/yellow_2024_02.parquet</text>
+  <text x="42" y="230" font-size="8.4" fill="#777">no metadata layer — just files</text>
+
+  <!-- delta prefix -->
+  <rect x="32" y="248" width="298" height="94" rx="5" fill="#fff" stroke="#4a7fc9"/>
+  <text x="42" y="265" font-size="9.6" font-weight="bold" fill="#14508f">delta/  —  Databricks Delta table</text>
+  <text x="42" y="280" font-size="8.8" font-family="monospace" fill="#444">delta/trips/part-00000-....snappy.parquet</text>
+  <text x="42" y="293" font-size="8.8" font-family="monospace" fill="#444">delta/trips/part-00001-....snappy.parquet</text>
+  <text x="42" y="309" font-size="8.8" font-family="monospace" fill="#c2410c" font-weight="bold">delta/trips/_delta_log/00000.json</text>
+  <text x="42" y="322" font-size="8.8" font-family="monospace" fill="#c2410c" font-weight="bold">delta/trips/_delta_log/00001.json</text>
+  <text x="42" y="335" font-size="8.4" fill="#777">same Parquet + a transaction log</text>
+
+  <!-- PATH 1 arrow -->
+  <line x1="346" y1="205" x2="470" y2="205" stroke="#2e7d32" stroke-width="2.2" marker-end="url(#ag)"/>
+  <rect x="356" y="176" width="106" height="24" rx="4" fill="#e8f5e9" stroke="#2e7d32"/>
+  <text x="409" y="192" text-anchor="middle" font-size="9.3" font-weight="bold" fill="#1b5e20">1  COPY</text>
+  <text x="409" y="222" text-anchor="middle" font-size="8.4" fill="#2e7d32">loads data IN</text>
+
+  <!-- REDSHIFT -->
+  <rect x="474" y="160" width="230" height="92" rx="6" fill="#eaf1fb" stroke="#2f5fa8" stroke-width="2"/>
+  <text x="589" y="182" text-anchor="middle" font-weight="bold" font-size="12" fill="#1b3a70">Amazon Redshift</text>
+  <text x="589" y="200" text-anchor="middle" font-size="9.3" fill="#333">data stored INSIDE the cluster</text>
+  <text x="589" y="216" text-anchor="middle" font-size="9.3" fill="#333">columnar · sort + dist keys</text>
+  <text x="589" y="234" text-anchor="middle" font-size="8.8" fill="#666">BI · dashboards · SQL clients</text>
+
+  <!-- PATH 2 arrows (bidirectional) -->
+  <line x1="346" y1="286" x2="470" y2="308" stroke="#c2410c" stroke-width="2.2" marker-end="url(#ab)"/>
+  <line x1="470" y1="330" x2="346" y2="308" stroke="#c2410c" stroke-width="2.2" marker-end="url(#ab)"/>
+  <rect x="352" y="278" width="112" height="24" rx="4" fill="#fff1e8" stroke="#c2410c"/>
+  <text x="408" y="294" text-anchor="middle" font-size="9.3" font-weight="bold" fill="#9a3412">2  read / write</text>
+
+  <!-- DATABRICKS -->
+  <rect x="474" y="272" width="230" height="92" rx="6" fill="#fdeee6" stroke="#c2410c" stroke-width="2"/>
+  <text x="589" y="294" text-anchor="middle" font-weight="bold" font-size="12" fill="#9a3412">Databricks</text>
+  <text x="589" y="312" text-anchor="middle" font-size="9.3" fill="#333">compute only — NO data stored</text>
+  <text x="589" y="328" text-anchor="middle" font-size="9.3" fill="#333">Unity Catalog holds metadata</text>
+  <text x="589" y="346" text-anchor="middle" font-size="8.8" fill="#666">Spark · SQL · notebooks · ML</text>
+
+  <!-- key difference callout -->
+  <rect x="16" y="374" width="688" height="82" rx="6" fill="#f6f8fa" stroke="#999" stroke-dasharray="4,3"/>
+  <text x="30" y="394" font-size="10.4" font-weight="bold" fill="#222">The key difference</text>
+  <text x="30" y="413" font-size="9.6" fill="#1b5e20">▸ <tspan font-weight="bold">Redshift COPIES data in.</tspan>
+    S3 is the source; the cluster owns its own copy. Two copies now exist.</text>
+  <text x="30" y="431" font-size="9.6" fill="#9a3412">▸ <tspan font-weight="bold">Databricks LEAVES data in S3.</tspan>
+    The table IS the S3 folder. Compute is detachable and disposable.</text>
+  <text x="30" y="449" font-size="9.6" fill="#444">▸ Both can share the <tspan font-weight="bold">same bucket</tspan> —
+    different prefixes, different permissions, no conflict.</text>
+</svg>
+<p class="cap">One bucket, two consumption models: copy-in versus query-in-place.</p>
+
+<!-- ============ PAGE 2 ============ -->
+<div class="page"></div>
+<h2>Path 1 — S3 Parquet into Redshift</h2>
+
+<svg viewBox="0 0 700 300" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial" font-size="11">
+  <defs>
+    <marker id="b" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#2e7d32"/>
+    </marker>
+  </defs>
+
+  <!-- S3 -->
+  <rect x="14" y="90" width="150" height="80" rx="6" fill="#fff8ee" stroke="#FF9900" stroke-width="2"/>
+  <text x="89" y="116" text-anchor="middle" font-weight="bold" fill="#8a5200">S3</text>
+  <text x="89" y="134" text-anchor="middle" font-size="8.8" font-family="monospace" fill="#444">raw/taxi/*.parquet</text>
+  <text x="89" y="152" text-anchor="middle" font-size="8.6" fill="#777">48 MB · 2.9M rows</text>
+
+  <!-- IAM role -->
+  <rect x="230" y="18" width="220" height="52" rx="6" fill="#f3e8fd" stroke="#7e3ff2" stroke-width="1.6"/>
+  <text x="340" y="38" text-anchor="middle" font-size="10" font-weight="bold" fill="#4c1d95">IAM Role</text>
+  <text x="340" y="55" text-anchor="middle" font-size="8.7" fill="#444">Redshift assumes it to read S3</text>
+  <line x1="340" y1="70" x2="340" y2="106" stroke="#7e3ff2" stroke-width="1.5" stroke-dasharray="4,3"/>
+
+  <!-- COPY -->
+  <line x1="164" y1="130" x2="264" y2="130" stroke="#2e7d32" stroke-width="2.2" marker-end="url(#b)"/>
+  <rect x="266" y="108" width="148" height="46" rx="5" fill="#e8f5e9" stroke="#2e7d32" stroke-width="1.8"/>
+  <text x="340" y="127" text-anchor="middle" font-size="10.5" font-weight="bold" fill="#1b5e20">COPY command</text>
+  <text x="340" y="144" text-anchor="middle" font-size="8.6" fill="#2e7d32">parallel load, all slices</text>
+  <line x1="414" y1="130" x2="510" y2="130" stroke="#2e7d32" stroke-width="2.2" marker-end="url(#b)"/>
+
+  <!-- Redshift -->
+  <rect x="512" y="82" width="176" height="96" rx="6" fill="#eaf1fb" stroke="#2f5fa8" stroke-width="2"/>
+  <text x="600" y="106" text-anchor="middle" font-weight="bold" fill="#1b3a70">Redshift</text>
+  <text x="600" y="126" text-anchor="middle" font-size="8.8" font-family="monospace" fill="#444">CREATE TABLE trips</text>
+  <text x="600" y="143" text-anchor="middle" font-size="8.6" fill="#333">DISTKEY · SORTKEY</text>
+  <text x="600" y="161" text-anchor="middle" font-size="8.6" fill="#666">data lives in the cluster</text>
+
+  <!-- alternatives strip -->
+  <rect x="14" y="200" width="674" height="88" rx="6" fill="#f6f8fa" stroke="#aaa"/>
+  <text x="28" y="220" font-size="10.2" font-weight="bold" fill="#222">Four ways to get S3 data into / visible to Redshift</text>
+  <text x="28" y="240" font-size="9.3" fill="#1b5e20">① <tspan font-weight="bold">COPY</tspan> — bulk load into the cluster. Fastest queries. Data duplicated.</text>
+  <text x="28" y="257" font-size="9.3" fill="#333">② <tspan font-weight="bold">Spectrum</tspan> — external table, query S3 in place. No load, no copy. Slower.</text>
+  <text x="28" y="274" font-size="9.3" fill="#333">③ <tspan font-weight="bold">Glue ETL</tspan> — transform on the way in. ④ <tspan font-weight="bold">Zero-ETL</tspan> — auto-replicate from Aurora/RDS.</text>
+</svg>
+
+<h3>The COPY command</h3>
+<pre>-- 1. table must exist first
+CREATE TABLE trips (
+    vendor_id      INTEGER,
+    pickup_ts      TIMESTAMP,
+    dropoff_ts     TIMESTAMP,
+    trip_distance  DOUBLE PRECISION,
+    fare_amount    DOUBLE PRECISION,
+    pu_location_id INTEGER
+)
+DISTKEY (pu_location_id)      -- how rows spread across compute nodes
+SORTKEY (pickup_ts);          -- how rows are ordered within a node
+
+-- 2. load
+COPY trips
+FROM 's3://naveen-data-lab-457360056131/raw/taxi/'
+IAM_ROLE 'arn:aws:iam::457360056131:role/RedshiftS3Read'
+FORMAT AS PARQUET;</pre>
+
+<div class="why"><b>Why COPY and not INSERT.</b> <code>COPY</code> loads in <b>parallel across every slice</b>
+of the cluster at once. Row-by-row <code>INSERT</code> goes through the leader node single-threaded and is
+orders of magnitude slower. Never use INSERT for bulk loads.</div>
+
+<h3>The IAM role — the part that trips people up</h3>
+<pre>Trust policy    : allows redshift.amazonaws.com to assume the role
+Permissions     : s3:GetObject + s3:ListBucket on your bucket
+Then            : attach the role to the Redshift cluster/namespace</pre>
+<p>Redshift does not use your credentials. It <b>assumes a role</b>. If <code>COPY</code> fails with
+<code>Access Denied</code>, it is almost always the trust policy or a missing
+<code>s3:ListBucket</code> on the <i>bucket</i> ARN (not just the object ARN).</p>
+
+<h3>Alternative: Spectrum — no copy at all</h3>
+<pre>CREATE EXTERNAL SCHEMA spectrum_schema
+FROM DATA CATALOG DATABASE 'my_glue_db'
+IAM_ROLE 'arn:aws:iam::457360056131:role/RedshiftS3Read';
+
+SELECT * FROM spectrum_schema.trips WHERE pickup_date = '2024-01-15';</pre>
+<p>Redshift queries the Parquet in S3 directly via the Glue Data Catalog. No storage cost in the cluster, but
+each query pays S3 read latency. Good for cold/archive data, weak for high-concurrency dashboards.</p>
+
+<!-- ============ PAGE 3 ============ -->
+<div class="page"></div>
+<h2>Path 2 — Databricks Delta tables in the same bucket</h2>
+
+<svg viewBox="0 0 700 330" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial" font-size="11">
+  <defs>
+    <marker id="c" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#c2410c"/>
+    </marker>
+  </defs>
+
+  <!-- Databricks -->
+  <rect x="14" y="30" width="180" height="96" rx="6" fill="#fdeee6" stroke="#c2410c" stroke-width="2"/>
+  <text x="104" y="54" text-anchor="middle" font-weight="bold" fill="#9a3412">Databricks</text>
+  <text x="104" y="73" text-anchor="middle" font-size="8.8" fill="#333">Spark cluster (compute)</text>
+  <text x="104" y="90" text-anchor="middle" font-size="8.8" fill="#333">notebook / job</text>
+  <text x="104" y="110" text-anchor="middle" font-size="8.4" fill="#777">stores NO data itself</text>
+
+  <!-- Unity Catalog -->
+  <rect x="14" y="150" width="180" height="72" rx="6" fill="#f3e8fd" stroke="#7e3ff2" stroke-width="1.6"/>
+  <text x="104" y="172" text-anchor="middle" font-size="10.4" font-weight="bold" fill="#4c1d95">Unity Catalog</text>
+  <text x="104" y="190" text-anchor="middle" font-size="8.7" fill="#444">table names, schemas,</text>
+  <text x="104" y="205" text-anchor="middle" font-size="8.7" fill="#444">permissions, lineage</text>
+  <text x="104" y="219" text-anchor="middle" font-size="8.2" fill="#777">points AT the S3 path</text>
+
+  <line x1="104" y1="126" x2="104" y2="148" stroke="#7e3ff2" stroke-width="1.5" stroke-dasharray="3,3"/>
+
+  <!-- write arrow -->
+  <line x1="194" y1="78" x2="284" y2="78" stroke="#c2410c" stroke-width="2.2" marker-end="url(#c)"/>
+  <text x="239" y="70" text-anchor="middle" font-size="8.6" fill="#9a3412">saveAsTable</text>
+
+  <!-- S3 delta folder -->
+  <rect x="288" y="20" width="398" height="240" rx="7" fill="#fff8ee" stroke="#FF9900" stroke-width="2.2"/>
+  <text x="487" y="42" text-anchor="middle" font-weight="bold" font-size="11.5" fill="#8a5200">
+    S3 — the table IS this folder</text>
+  <text x="487" y="57" text-anchor="middle" font-size="8.5" font-family="monospace" fill="#8a5200">
+    s3://naveen-data-lab-457360056131/delta/trips/</text>
+
+  <!-- data files -->
+  <rect x="304" y="72" width="366" height="72" rx="5" fill="#fff" stroke="#4a7fc9" stroke-width="1.4"/>
+  <text x="316" y="90" font-size="9.6" font-weight="bold" fill="#14508f">DATA — ordinary Parquet files</text>
+  <text x="316" y="107" font-size="8.6" font-family="monospace" fill="#444">part-00000-a1b2....snappy.parquet</text>
+  <text x="316" y="120" font-size="8.6" font-family="monospace" fill="#444">part-00001-c3d4....snappy.parquet</text>
+  <text x="316" y="136" font-size="8.3" fill="#777">readable by Spark, Athena, pandas, DuckDB…</text>
+
+  <!-- delta log -->
+  <rect x="304" y="154" width="366" height="94" rx="5" fill="#fff5f0" stroke="#c2410c" stroke-width="1.6"/>
+  <text x="316" y="172" font-size="9.6" font-weight="bold" fill="#9a3412">_delta_log/ — the transaction log</text>
+  <text x="316" y="189" font-size="8.6" font-family="monospace" fill="#444">00000000000000000000.json &nbsp;← commit 0</text>
+  <text x="316" y="202" font-size="8.6" font-family="monospace" fill="#444">00000000000000000001.json &nbsp;← commit 1</text>
+  <text x="316" y="215" font-size="8.6" font-family="monospace" fill="#444">00000000000000000010.checkpoint.parquet</text>
+  <text x="316" y="232" font-size="8.3" fill="#9a3412">each JSON lists which Parquet files are IN the table</text>
+  <text x="316" y="244" font-size="8.3" fill="#777">this is what gives ACID, time travel, MERGE</text>
+
+  <!-- other readers -->
+  <rect x="14" y="276" width="672" height="44" rx="6" fill="#f6f8fa" stroke="#999" stroke-dasharray="4,3"/>
+  <text x="28" y="296" font-size="9.5" fill="#333">
+    <tspan font-weight="bold">Because the data is just S3:</tspan> Athena, EMR, Glue, Trino and even Redshift
+    Spectrum can read the same folder —</text>
+  <text x="28" y="312" font-size="9.5" fill="#333">
+    provided they understand the <tspan font-family="monospace">_delta_log</tspan>, or you generate a manifest for them.</text>
+</svg>
+
+<h3>Writing the table</h3>
+<pre># Databricks notebook
+(df.write
+   .format("delta")
+   .mode("overwrite")
+   .partitionBy("pickup_date")
+   .save("s3://naveen-data-lab-457360056131/delta/trips"))
+
+# or as a catalog-registered table
+df.write.format("delta").saveAsTable("main.default.trips")</pre>
+
+<h3>What <code>_delta_log</code> actually does</h3>
+<table>
+<tr><th style="width:26%">Without it (plain Parquet)</th><th>With it (Delta)</th></tr>
+<tr><td>A folder of files. "The table" = whatever files happen to be there.</td>
+    <td>The log lists exactly which files belong to each version.</td></tr>
+<tr><td>A failed write leaves half-written garbage readers can see.</td>
+    <td>Commits are atomic — readers never see a partial write.</td></tr>
+<tr><td>No UPDATE / DELETE / MERGE.</td>
+    <td>Full <code>MERGE INTO</code>, <code>UPDATE</code>, <code>DELETE</code>.</td></tr>
+<tr><td>No history.</td>
+    <td>Time travel: <code>VERSION AS OF 3</code>.</td></tr>
+<tr><td>Schema drift silently corrupts data.</td>
+    <td>Schema enforced on write.</td></tr>
+</table>
+
+<div class="why"><b>The mental model:</b> Delta = Parquet + a folder of JSON commits. Nothing proprietary,
+nothing locked in. Delete <code>_delta_log</code> and you still have readable Parquet — you just lose ACID,
+history and the ability to know which files are current.</div>
+
+<!-- ============ PAGE 4 ============ -->
+<div class="page"></div>
+<h2>Bucket layout &amp; who touches what</h2>
+
+<pre>s3://naveen-data-lab-457360056131/
+│
+├── raw/                          ← landing zone, plain Parquet
+│   └── taxi/
+│       ├── yellow_2024_01.parquet
+│       └── yellow_2024_02.parquet
+│                                    read by: Redshift COPY, Databricks, Athena
+│
+├── delta/                        ← Databricks-managed Delta tables
+│   └── trips/
+│       ├── pickup_date=2024-01-15/
+│       │   └── part-00000-....snappy.parquet
+│       ├── pickup_date=2024-01-16/
+│       │   └── part-00000-....snappy.parquet
+│       └── _delta_log/
+│           ├── 00000000000000000000.json
+│           ├── 00000000000000000001.json
+│           └── 00000000000000000010.checkpoint.parquet
+│                                    written by: Databricks only
+│
+├── curated/                      ← outputs for BI / downstream
+│   └── daily_metrics/*.parquet
+│
+└── athena-results/               ← query scratch (set a lifecycle rule!)</pre>
+
+<h3>Who does what</h3>
+<table>
+<tr><th style="width:20%">Prefix</th><th style="width:26%">Written by</th><th>Read by</th></tr>
+<tr><td><code>raw/</code></td><td>Ingest jobs, Flink, CLI upload</td><td>Redshift COPY · Databricks · Athena · Glue</td></tr>
+<tr><td><code>delta/</code></td><td><b>Databricks only</b></td><td>Databricks · Athena (via manifest) · Trino</td></tr>
+<tr><td><code>curated/</code></td><td>Databricks / Glue</td><td>Redshift Spectrum · Athena · BI tools</td></tr>
+</table>
+
+<div class="warn"><b>One writer per prefix.</b> Never let two systems write the same Delta table folder.
+Delta's ACID guarantees rely on a single coordinated writer protocol; a stray Spark job or a manual S3 upload
+into <code>delta/trips/</code> will corrupt the table's view of itself.</div>
+
+<h3>IAM — the two roles you need</h3>
+<pre>RedshiftS3Read              (assumed by Redshift)
+  trust : redshift.amazonaws.com
+  allow : s3:GetObject     on  arn:aws:s3:::naveen-data-lab-457360056131/raw/*
+          s3:ListBucket    on  arn:aws:s3:::naveen-data-lab-457360056131
+
+DatabricksS3Access          (assumed by Databricks, cross-account)
+  trust : Databricks' AWS account + external ID
+  allow : s3:GetObject, s3:PutObject, s3:DeleteObject, s3:ListBucket
+          on the whole bucket (Delta needs write + delete for compaction)</pre>
+
+<div class="warn"><code>s3:ListBucket</code> must be granted on the <b>bucket</b> ARN, not the object ARN.
+Granting it only on <code>bucket/*</code> is the single most common cause of a mysterious
+<code>Access Denied</code> during <code>COPY</code>.</div>
+
+<h3>Choosing between the two paths</h3>
+<table>
+<tr><th style="width:22%">Question</th><th>Redshift (COPY)</th><th>Databricks (Delta on S3)</th></tr>
+<tr><td>Where does data live?</td><td>Inside the cluster (a 2nd copy)</td><td>Only in S3 (one copy)</td></tr>
+<tr><td>Query latency</td><td>Lowest — local columnar storage</td><td>Good, but reads from S3</td></tr>
+<tr><td>Concurrency</td><td>Excellent for BI</td><td>Good; scales by adding compute</td></tr>
+<tr><td>Cost when idle</td><td>Cluster keeps running</td><td><b>Zero</b> — turn compute off, data stays</td></tr>
+<tr><td>Other engines can read it</td><td>No</td><td><b>Yes</b> — open Parquet format</td></tr>
+<tr><td>Best for</td><td>BI dashboards, SQL analysts</td><td>ETL, ML, big transforms, data lake</td></tr>
+</table>
+
+<div class="why"><b>They are not competitors here.</b> The common pattern is: Databricks does the heavy
+transformation and writes curated Parquet/Delta to S3; Redshift <code>COPY</code>s (or Spectrum-queries) the
+small curated result for BI. S3 is the shared, durable middle.</div>
+
+<h3>The end-to-end flow, in words</h3>
+<ol>
+<li>Source systems drop Parquet into <code>s3://.../raw/</code></li>
+<li><b>Databricks</b> reads <code>raw/</code>, cleans and joins it, writes Delta to <code>delta/</code> —
+data files and <code>_delta_log</code> side by side in the same bucket</li>
+<li>Databricks writes a small aggregated result to <code>curated/</code> as plain Parquet</li>
+<li><b>Redshift</b> <code>COPY</code>s <code>curated/</code> into cluster tables for BI, or reads it in place
+via Spectrum</li>
+<li>Dashboards query Redshift; data scientists query Delta from Databricks. One bucket, one copy of the truth.</li>
+</ol>
+
+<p class="small" style="margin-top:14pt; border-top:1px solid #ccc; padding-top:6pt">
+Account 457360056131 · us-east-1 · bucket <code>naveen-data-lab-457360056131</code>. Replace ARNs and paths
+with your own before applying.
+</p>
